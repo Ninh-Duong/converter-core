@@ -6,14 +6,17 @@ A lightweight, self-contained CLI tool for converting documents between **PDF**,
 
 ## Key Features
 
+- **Modular & Clean Architecture**: Logic is neatly decomposed into dedicated modules (`bootstrap`, `engines`, `i18n`) with a minimal CLI entry point.
 - **Smart Hybrid Routing**:
   - **Fast Vector Engine (`pdf2docx`)**: Converts digital/native PDFs into Word in ~0.5 seconds, preserving 100% tables, fonts, and alignment without OCR.
   - **Vision AI Engine (Gemini Flash)**: Handles scanned documents, handwritten notes, and photos with 100% accurate Vietnamese diacritics and automatic table formatting.
   - **Offline Tesseract Fallback**: Operates completely offline using native 1:1 image extraction and layout heuristics when no internet or API key is available.
+- **Bilingual Interface (English & Tiếng Việt)**: Full English interface by default, with instant on-the-fly language toggle (`'l'`).
 - **Two-Way Document Conversion**: Supports PDF ⇄ DOCX and Image (`.png`, `.jpg`, `.jpeg`) → DOCX.
-- **Self-Bootstrapping**: Automatically checks and installs all missing dependencies on the first run with a visual CLI loading progress indicator.
-- **Cross-Environment Portability**: All paths are resolved relative to the repository root, ensuring smooth deployment on Windows, Linux, macOS, or Docker.
-- **Privacy & Security First**: Pre-configured `.gitignore` ensures your documents, temporary files, and API secrets are never committed to version control.
+- **Self-Bootstrapping**: Automatically checks and installs missing dependencies on the first run with a visual CLI loading progress indicator.
+- **Built-in Unit Tests**: Includes an automated test suite verifying core functions, i18n consistency, and layout renderers.
+- **Cross-Environment Portability**: All paths are resolved relative to the repository root.
+- **Privacy & Security First**: Pre-configured `.gitignore` ensures documents, temporary files, and API secrets are never committed to version control.
 
 ---
 
@@ -21,12 +24,18 @@ A lightweight, self-contained CLI tool for converting documents between **PDF**,
 
 ```text
 converter-core/
-├── convert.py          # Main CLI application (with auto-installer & hybrid router)
-├── requirements.txt    # Python package dependencies
-├── .env.example        # Environment variable template
-├── .gitignore          # Git exclusion rules (safeguards files/ and .env)
-├── tessdata/           # Offline language data (vie, eng, osd)
-└── files/              # Workspace directory for input & output files
+├── core/
+│   ├── __init__.py
+│   ├── bootstrap.py     # Dependency auto-installer & environment paths
+│   ├── engines.py       # Conversion engines (Vector, Vision AI, Tesseract, Office)
+│   └── i18n.py          # Multi-language dictionary & translation helper
+├── convert.py           # Lean CLI runner (~60 lines)
+├── test_converter.py    # Automated unit test suite
+├── requirements.txt     # Python package dependencies
+├── .env.example         # Environment variable template
+├── .gitignore           # Git exclusion rules (safeguards files/ and .env)
+├── tessdata/            # Offline language data (vie, eng, osd)
+└── files/               # Workspace directory for input & output files
     └── .gitkeep
 ```
 
@@ -57,7 +66,16 @@ Place the documents you wish to convert (`.pdf`, `.docx`, `.png`, `.jpg`) into t
 ```bash
 python convert.py
 ```
-> **Note**: On the first run, the tool automatically detects missing libraries and installs them. Subsequent runs start instantly.
+> **Tip**: Press `'l'` at the file selection prompt to toggle between **English** and **Tiếng Việt**.
+
+---
+
+## Running Unit Tests
+
+Run the built-in test suite:
+```bash
+python test_converter.py
+```
 
 ---
 
@@ -76,26 +94,6 @@ For superior accuracy with complex scanned documents and tables, you can enable 
    ```
 
 If no key is configured, the system automatically falls back to the **local Tesseract OCR engine** with zero interruption.
-
----
-
-## Usage Guide
-
-1. Run `python convert.py`.
-2. The CLI presents an interactive menu listing all documents in `files/`:
-   ```text
-   === FILE TRONG 'files/' ===
-   [1] sample_contract.pdf
-   [2] report.docx
-
-   Chọn số file [1-2] (Enter để chọn 1, 'q' để thoát): 1
-
-   Chọn chế độ convert:
-   [1] -> .docx (Tự động Hybrid: Fast Vector -> Vision AI -> Tesseract Offline)
-   [2] -> .docx (Ép chạy Tesseract OCR Offline)
-   Chọn chế độ [1-2] (Enter để chọn 1, 'q' để thoát): 1
-   ```
-3. The converted document is saved directly in the `files/` directory.
 
 ---
 
