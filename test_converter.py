@@ -5,7 +5,7 @@ from pathlib import Path
 import docx
 import pymupdf
 
-from core.bootstrap import REPO_DIR, FILES_DIR, TESSDATA_DIR
+from core.bootstrap import REPO_DIR, FILES_DIR, DOCS_DIR, IMGS_DIR, TESSDATA_DIR
 from core.i18n import TRANSLATIONS, t, set_language, toggle_language, get_language
 from core.engines import (
     is_scanned_pdf,
@@ -19,6 +19,8 @@ class TestConverterCore(unittest.TestCase):
         """Ensure all project directories are resolved relatively."""
         self.assertTrue(REPO_DIR.exists(), "REPO_DIR must exist.")
         self.assertTrue(FILES_DIR.exists(), "FILES_DIR must exist.")
+        self.assertTrue(DOCS_DIR.exists(), "DOCS_DIR must exist.")
+        self.assertTrue(IMGS_DIR.exists(), "IMGS_DIR must exist.")
         self.assertTrue(TESSDATA_DIR.exists(), "TESSDATA_DIR must exist.")
 
     def test_i18n_consistency(self):
@@ -51,8 +53,10 @@ class TestConverterCore(unittest.TestCase):
         self.assertEqual(docx_opts[0][1], "pdf")
 
         img_opts = get_converter_options(".png")
-        self.assertGreaterEqual(len(img_opts), 1)
-        self.assertEqual(img_opts[0][1], "docx")
+        self.assertGreaterEqual(len(img_opts), 2)
+        target_exts = [opt[1] for opt in img_opts]
+        self.assertIn("txt", target_exts)
+        self.assertIn("docx", target_exts)
 
         self.assertEqual(get_converter_options(".unknown"), [])
 
@@ -121,6 +125,24 @@ class TestConverterCore(unittest.TestCase):
         ok, msg = validate_gemini_connection(api_key="")
         self.assertFalse(ok)
         self.assertIn("GEMINI_API_KEY", msg)
+
+    def test_image_to_txt_tesseract(self):
+        """Test reading text from an image to a txt file using Tesseract."""
+        from PIL import Image, ImageDraw
+        from core.engines import image_to_txt_tesseract
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            img_path = Path(tmpdir) / "test.png"
+            txt_path = Path(tmpdir) / "test.txt"
+
+            img = Image.new("RGB", (200, 60), color="white")
+            draw = ImageDraw.Draw(img)
+            draw.text((10, 20), "HELLO", fill="black")
+            img.save(str(img_path))
+
+            image_to_txt_tesseract(img_path, txt_path)
+            self.assertTrue(txt_path.exists())
+            self.assertIn("HELLO", txt_path.read_text(encoding="utf-8").strip())
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

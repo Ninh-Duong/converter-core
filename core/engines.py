@@ -474,6 +474,66 @@ def docx_to_pdf(src: Path, dst: Path):
     from docx2pdf import convert as d2p
     d2p(str(src), str(dst))
 
+def _print_text_preview(text: str):
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    print("\n" + "=" * 60)
+    print(f"--- TEXT EXTRACTED FROM IMAGE / NỘI DUNG ĐỌC ĐƯỢC ({len(text.strip())} chars) ---")
+    print("-" * 60)
+    if lines:
+        preview_lines = lines[:12]
+        print("\n".join(preview_lines))
+        if len(lines) > 12:
+            print(f"... ({len(lines) - 12} more lines in file)")
+    else:
+        print("(No text detected / Không nhận diện được ký tự)")
+    print("=" * 60 + "\n")
+
+def image_to_txt_ai(src: Path, dst: Path):
+    """Extract all text from image using Gemini Vision AI."""
+    print(t("validating_ai"))
+    ok, msg = validate_gemini_connection()
+    if not ok:
+        print(t("ai_connect_failed", error=msg))
+        print(t("falling_back_tesseract"))
+        image_to_txt_tesseract(src, dst)
+        return
+
+    print(t("ai_connect_success"))
+    print(t("running_vision_ai"))
+    text = process_page_with_vision_ai(src.read_bytes(), get_gemini_api_key())
+    dst.write_text(text, encoding="utf-8")
+    _print_text_preview(text)
+
+def preprocess_image_for_tesseract(img):
+    """Auto-crop margins, invert dark mode, and add quiet-zone padding for Tesseract OCR."""
+    from PIL import ImageOps
+    gray = img.convert("L")
+    inv = ImageOps.invert(gray)
+    bbox = inv.getbbox()
+    cropped = gray.crop(bbox) if bbox else gray
+    hist = cropped.histogram()
+    pixels = sum(hist)
+    avg_brightness = sum(i * n for i, n in enumerate(hist)) / pixels if pixels else 255
+    if avg_brightness < 128:
+        cropped = ImageOps.invert(cropped)
+    # Add quiet-zone whitespace border required by Tesseract for edge characters
+    return ImageOps.expand(cropped, border=25, fill=255)
+
+def image_to_txt_tesseract(src: Path, dst: Path):
+    """Extract all text from image using local Tesseract OCR."""
+    if not TESSERACT_CMD:
+        print(t("tesseract_not_found"))
+        return
+    import pytesseract
+    from PIL import Image
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+    print(t("running_tesseract"))
+    raw_img = Image.open(src)
+    prep_img = preprocess_image_for_tesseract(raw_img)
+    text = pytesseract.image_to_string(prep_img, lang="vie+eng")
+    dst.write_text(text, encoding="utf-8")
+    _print_text_preview(text)
+
 def get_converter_options(ext: str):
     """Return conversion options available for a file extension."""
     ext = ext.lower()
@@ -489,6 +549,8 @@ def get_converter_options(ext: str):
         ]
     elif ext in [".png", ".jpg", ".jpeg"]:
         return [
+            ("mode_image_txt_tess", "txt", image_to_txt_tesseract),
+            ("mode_image_txt_ai", "txt", image_to_txt_ai),
             ("mode_image_ai", "docx", image_to_docx_ai),
             ("mode_image_tesseract", "docx", image_to_docx_tesseract),
         ]

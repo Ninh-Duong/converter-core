@@ -24,6 +24,7 @@ secrets/
 # User conversion files (prevent uploading private documents)
 files/*
 !files/.gitkeep
+!files/*/.gitkeep
 
 # Temporary Office Lock files
 ~$*

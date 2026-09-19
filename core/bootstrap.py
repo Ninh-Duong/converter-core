@@ -52,8 +52,24 @@ from dotenv import load_dotenv
 # -------------------------------------------------------------
 REPO_DIR = Path(__file__).parent.parent.resolve()
 FILES_DIR = REPO_DIR / "files"
+DOCS_DIR = FILES_DIR / "documents"
+IMGS_DIR = FILES_DIR / "images"
 TESSDATA_DIR = REPO_DIR / "tessdata"
 ENV_PATH = REPO_DIR / ".env"
+
+def init_workspace_dirs():
+    """Ensure category directories exist and migrate any files from root files/."""
+    DOCS_DIR.mkdir(parents=True, exist_ok=True)
+    IMGS_DIR.mkdir(parents=True, exist_ok=True)
+    if FILES_DIR.exists():
+        for item in FILES_DIR.iterdir():
+            if item.is_file() and not item.name.startswith("~$") and item.name != ".gitkeep":
+                target_dir = IMGS_DIR if item.suffix.lower() in [".png", ".jpg", ".jpeg"] else DOCS_DIR
+                target_file = target_dir / item.name
+                if not target_file.exists():
+                    shutil.move(str(item), str(target_file))
+
+init_workspace_dirs()
 
 if ENV_PATH.exists():
     load_dotenv(dotenv_path=ENV_PATH)
