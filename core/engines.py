@@ -140,24 +140,60 @@ def pdf_vision_ai_to_docx(src: Path, dst: Path, api_key: str):
         sec.left_margin = Inches(1)
         sec.right_margin = Inches(1)
 
-    for idx, page in enumerate(pdf_in, 1):
-        print(t("page_progress_ai", page=idx, total=len(pdf_in)))
-        images = page.get_images()
-        if images:
-            xref = images[0][0]
-            base_img = pdf_in.extract_image(xref)
-            img_bytes = base_img["image"]
-        else:
-            pix = page.get_pixmap(dpi=200)
-            img_bytes = pix.tobytes("png")
+def get_page_image_slices(page, pdf_in) -> list[bytes]:
+    """Extract page image(s), automatically splitting 2-up landscape scans into portrait sub-pages."""
+    from PIL import Image
+    images = page.get_images()
+    raw = pdf_in.extract_image(images[0][0])["image"] if images else page.get_pixmap(dpi=200).tobytes("png")
+    img = Image.open(io.BytesIO(raw))
+    w, h = img.size
+    if w > h * 1.25:
+        slices = []
+        for box in ((0, 0, w // 2, h), (w // 2, 0, w, h)):
+            buf = io.BytesIO()
+            img.crop(box).save(buf, format="PNG")
+            slices.append(buf.getvalue())
+        return slices
+    return [raw]
 
+def save_docx_safely(doc_out, dst: Path) -> Path:
+    """Save Word document, safely falling back to <stem>_fixed.docx if target is open/locked in Word."""
+    try:
+        doc_out.save(str(dst))
+        return dst
+    except PermissionError:
+        fallback = dst.with_name(f"{dst.stem}_fixed{dst.suffix}")
+        doc_out.save(str(fallback))
+        print(f"\n[!] Warning: '{dst.name}' is open/locked. Saved to '{fallback.name}' instead.")
+        return fallback
+
+def pdf_vision_ai_to_docx(src: Path, dst: Path, api_key: str):
+    import pymupdf, docx
+    from docx.shared import Inches
+
+    print(t("running_vision_ai"))
+    pdf_in = pymupdf.open(str(src))
+    doc_out = docx.Document()
+
+    for sec in doc_out.sections:
+        sec.top_margin = Inches(1)
+        sec.bottom_margin = Inches(1)
+        sec.left_margin = Inches(1)
+        sec.right_margin = Inches(1)
+
+    page_slices = []
+    for page in pdf_in:
+        page_slices.extend(get_page_image_slices(page, pdf_in))
+
+    for idx, img_bytes in enumerate(page_slices, 1):
+        print(t("page_progress_ai", page=idx, total=len(page_slices)))
         md_text = process_page_with_vision_ai(img_bytes, api_key)
         render_markdown_to_docx(md_text, doc_out)
-        if idx < len(pdf_in):
+        if idx < len(page_slices):
             doc_out.add_page_break()
 
     pdf_in.close()
-    doc_out.save(str(dst))
+    save_docx_safely(doc_out, dst)
 
 # -------------------------------------------------------------
 # 2. Local Tesseract OCR Engine (Offline Fallback)
@@ -169,64 +205,83 @@ def extract_page_layout_tesseract(img_bytes: bytes, tess_cmd: str):
 
     pytesseract.pytesseract.tesseract_cmd = tess_cmd
     img = Image.open(io.BytesIO(img_bytes))
+    _, h_total = img.size
     data = pytesseract.image_to_data(img, lang="vie", config="--psm 1", output_type=Output.DICT)
 
-    blocks = {}
+    raw_lines = []
+    cur_key, cur_line = None, None
     for i in range(len(data["text"])):
         w = data["text"][i].strip()
         if not w:
             continue
-        b = data["block_num"][i]
-        l = data["line_num"][i]
-        if b not in blocks:
-            blocks[b] = {}
-        if l not in blocks[b]:
-            blocks[b][l] = {
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        if key != cur_key:
+            cur_key = key
+            cur_line = {
                 "words": [w],
                 "left": data["left"][i],
                 "right": data["left"][i] + data["width"][i],
                 "top": data["top"][i],
                 "bottom": data["top"][i] + data["height"][i],
             }
+            raw_lines.append(cur_line)
         else:
-            blocks[b][l]["words"].append(w)
-            blocks[b][l]["right"] = max(blocks[b][l]["right"], data["left"][i] + data["width"][i])
-            blocks[b][l]["bottom"] = max(blocks[b][l]["bottom"], data["top"][i] + data["height"][i])
+            cur_line["words"].append(w)
+            cur_line["right"] = max(cur_line["right"], data["left"][i] + data["width"][i])
+            cur_line["bottom"] = max(cur_line["bottom"], data["top"][i] + data["height"][i])
 
+    # Sort lines vertically to prevent out-of-order column/block jumps
+    raw_lines.sort(key=lambda l: (round(l["top"] / 10) * 10, l["left"]))
+
+    # Merge line fragments on the same baseline (e.g. margin overflows like "bảo vệ")
+    merged = []
+    for l in raw_lines:
+        if merged and abs(merged[-1]["top"] - l["top"]) <= 8:
+            merged[-1]["words"].extend(l["words"])
+            merged[-1]["right"] = max(merged[-1]["right"], l["right"])
+            merged[-1]["bottom"] = max(merged[-1]["bottom"], l["bottom"])
+        else:
+            merged.append(l)
+
+    max_w = max((l["right"] - l["left"] for l in merged), default=1)
     page_elements = []
+    cur_body = []
 
-    for b_id in sorted(blocks.keys()):
-        lines_dict = blocks[b_id]
-        sorted_lines = [lines_dict[l] for l in sorted(lines_dict.keys())]
-        if not sorted_lines:
+    for idx, l in enumerate(merged):
+        text = " ".join(l["words"]).strip()
+        if not text:
             continue
 
-        max_w = max(l["right"] - l["left"] for l in sorted_lines)
-        current_body = []
-        for line in sorted_lines:
-            text = " ".join(line["words"]).strip()
-            if not text:
-                continue
+        # Ignore solitary page numbers in footer
+        if text.isdigit() and len(text) <= 3 and l["top"] > h_total * 0.85:
+            continue
 
-            w = line["right"] - line["left"]
-            is_short = w < (max_w * 0.85)
-            is_title = text.isupper() or text.startswith("CHƯƠNG") or text.startswith("Điều")
-            is_heading = text.startswith(("1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.", "1.1", "1.2", "1.3", "Mục "))
+        lw = l["right"] - l["left"]
+        is_short = lw < (max_w * 0.82)
+        is_title = text.isupper() or text.startswith(("CHƯƠNG", "Điều "))
+        is_heading = bool(re.match(r"^(\d+(\.\d+)*|Mục|\>|\-|\•)\b", text))
 
-            if is_title or is_heading:
-                if current_body:
-                    page_elements.append(("body", " ".join(current_body)))
-                    current_body = []
-                page_elements.append(("title" if is_title else "heading", text))
-                continue
+        if is_title or is_heading:
+            if cur_body:
+                page_elements.append(("body", " ".join(cur_body)))
+                cur_body = []
+            page_elements.append(("title" if is_title else "heading", text))
+            continue
 
-            current_body.append(text)
-            if is_short and text.endswith((".", ":", ";", "!", "?")):
-                page_elements.append(("body", " ".join(current_body)))
-                current_body = []
+        cur_body.append(text)
 
-        if current_body:
-            page_elements.append(("body", " ".join(current_body)))
+        next_is_heading = False
+        if idx + 1 < len(merged):
+            nxt = " ".join(merged[idx + 1]["words"]).strip()
+            if nxt.isupper() or nxt.startswith(("CHƯƠNG", "Điều ")) or re.match(r"^(\d+(\.\d+)*|Mục|\>|\-|\•)\b", nxt):
+                next_is_heading = True
+
+        if is_short or next_is_heading:
+            page_elements.append(("body", " ".join(cur_body)))
+            cur_body = []
+
+    if cur_body:
+        page_elements.append(("body", " ".join(cur_body)))
 
     return page_elements
 
@@ -277,24 +332,19 @@ def pdf_tesseract_to_docx(src: Path, dst: Path):
         sec.left_margin = Inches(1)
         sec.right_margin = Inches(1)
 
-    for idx, page in enumerate(pdf_in, 1):
-        print(t("page_progress_tess", page=idx, total=len(pdf_in)))
-        images = page.get_images()
-        if images:
-            xref = images[0][0]
-            base_img = pdf_in.extract_image(xref)
-            img_bytes = base_img["image"]
-        else:
-            pix = page.get_pixmap(dpi=200)
-            img_bytes = pix.tobytes("png")
+    page_slices = []
+    for page in pdf_in:
+        page_slices.extend(get_page_image_slices(page, pdf_in))
 
+    for idx, img_bytes in enumerate(page_slices, 1):
+        print(t("page_progress_tess", page=idx, total=len(page_slices)))
         elements = extract_page_layout_tesseract(img_bytes, TESSERACT_CMD)
         render_tesseract_elements_to_docx(doc_out, elements)
-        if idx < len(pdf_in):
+        if idx < len(page_slices):
             doc_out.add_page_break()
 
     pdf_in.close()
-    doc_out.save(str(dst))
+    save_docx_safely(doc_out, dst)
 
 # -------------------------------------------------------------
 # 3. Fast Vector PDF Engine (pdf2docx)

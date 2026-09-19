@@ -100,5 +100,20 @@ class TestConverterCore(unittest.TestCase):
             if tmp_path.exists():
                 tmp_path.unlink()
 
+    def test_landscape_slice_splitting(self):
+        """Ensure landscape pages (>1.25 aspect ratio) split into 2 sub-pages and portrait remain 1."""
+        from core.engines import get_page_image_slices
+        # Landscape document (800 x 400, aspect ratio 2.0)
+        doc = pymupdf.open()
+        p_land = doc.new_page(width=800, height=400)
+        slices_land = get_page_image_slices(p_land, doc)
+        self.assertEqual(len(slices_land), 2, "Landscape page must split into 2 slices.")
+
+        # Portrait document (400 x 600, aspect ratio 0.67)
+        p_port = doc.new_page(width=400, height=600)
+        slices_port = get_page_image_slices(p_port, doc)
+        self.assertEqual(len(slices_port), 1, "Portrait page must remain 1 slice.")
+        doc.close()
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
