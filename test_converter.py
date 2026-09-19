@@ -115,5 +115,13 @@ class TestConverterCore(unittest.TestCase):
         self.assertEqual(len(slices_port), 1, "Portrait page must remain 1 slice.")
         doc.close()
 
+    def test_validate_gemini_connection_empty(self):
+        """Test that validation fails gracefully when no API key is provided."""
+        from core.engines import validate_gemini_connection
+        ok, msg = validate_gemini_connection(api_key="")
+        self.assertFalse(ok)
+        self.assertIn("GEMINI_API_KEY", msg)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

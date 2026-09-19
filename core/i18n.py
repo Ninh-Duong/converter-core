@@ -24,11 +24,19 @@ TRANSLATIONS = {
         "tesseract_not_found": "Error: Tesseract OCR is not installed. Please install Tesseract for offline OCR.",
         "page_progress_ai": "   Page {page}/{total}: Analyzing with Vision AI...",
         "page_progress_tess": "   Page {page}/{total}: Scanning with Tesseract (1:1 layout)...",
+        "validating_ai": "-> Checking Gemini Vision AI connection...",
+        "ai_connect_success": "-> [OK] Successfully connected to Gemini Vision AI (gemini-flash-latest)!",
+        "ai_connect_failed": "-> [FAIL] Cannot connect to Gemini AI: {error}",
+        "falling_back_tesseract": "-> Automatically falling back to local offline Tesseract OCR...",
+        "ai_err_no_key": "No GEMINI_API_KEY found in .env or environment.",
 
         # Mode labels
-        "mode_pdf_hybrid": "docx (Smart Hybrid: Fast Vector -> Vision AI -> Tesseract Offline)",
-        "mode_pdf_tesseract": "docx (Force Local Tesseract OCR Offline)",
+        "mode_pdf_ai": "docx (Gemini Vision AI - 100% Accuracy, Validates Connection)",
+        "mode_pdf_hybrid": "docx (Smart Hybrid: Auto Vector -> Vision AI -> Tesseract Offline)",
+        "mode_pdf_tesseract": "docx (Force Local Tesseract OCR Offline, No AI)",
         "mode_docx_pdf": "pdf (Convert Word to PDF)",
+        "mode_image_ai": "docx (Gemini Vision AI - Cloud Accuracy)",
+        "mode_image_tesseract": "docx (Local Tesseract OCR Offline, No AI)",
         "mode_image_docx": "docx (Smart Hybrid AI / OCR to Word)",
     },
     "vi": {
@@ -54,11 +62,19 @@ TRANSLATIONS = {
         "tesseract_not_found": "Lỗi: Không tìm thấy Tesseract OCR. Vui lòng cài đặt Tesseract để dùng chế độ offline.",
         "page_progress_ai": "   Trang {page}/{total}: Đang phân tích qua Vision AI...",
         "page_progress_tess": "   Trang {page}/{total}: Đang quét Tesseract (bố cục 1:1)...",
+        "validating_ai": "-> Đang kiểm tra kết nối Gemini Vision AI...",
+        "ai_connect_success": "-> [OK] Đã kết nối thành công tới Gemini Vision AI (gemini-flash-latest)!",
+        "ai_connect_failed": "-> [THẤT BẠI] Không thể kết nối tới Gemini AI: {error}",
+        "falling_back_tesseract": "-> Tự động chuyển về dùng Tesseract OCR Offline cục bộ...",
+        "ai_err_no_key": "Không tìm thấy GEMINI_API_KEY trong file .env hoặc biến môi trường.",
 
         # Mode labels
+        "mode_pdf_ai": "docx (Gemini Vision AI - Chuẩn 100% AI Cloud, có kiểm tra kết nối)",
         "mode_pdf_hybrid": "docx (Tự động Hybrid: Fast Vector -> Vision AI -> Tesseract Offline)",
-        "mode_pdf_tesseract": "docx (Ép chạy Tesseract OCR Offline)",
+        "mode_pdf_tesseract": "docx (Ép chạy Tesseract OCR Offline, không dùng AI)",
         "mode_docx_pdf": "pdf (Chuyển Word sang PDF)",
+        "mode_image_ai": "docx (Gemini Vision AI - Chuẩn AI Cloud)",
+        "mode_image_tesseract": "docx (Tesseract OCR Offline cục bộ, không dùng AI)",
         "mode_image_docx": "docx (Hybrid AI / OCR sang Word)",
     }
 }

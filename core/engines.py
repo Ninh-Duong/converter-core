@@ -31,14 +31,20 @@ def process_page_with_vision_ai(img_bytes: bytes, api_key: str) -> str:
         "- Return raw Markdown only, no code fences."
     )
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[
-            types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
-            prompt
-        ]
-    )
-    return response.text
+    err = None
+    for m in ["gemini-flash-latest", "gemini-3.6-flash"]:
+        try:
+            response = client.models.generate_content(
+                model=m,
+                contents=[
+                    types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+                    prompt
+                ]
+            )
+            return response.text
+        except Exception as e:
+            err = e
+    raise err
 
 def render_markdown_to_docx(md_text: str, doc):
     """Render structured Markdown text into Microsoft Word DOCX elements."""
@@ -358,6 +364,44 @@ def pdf_layout_to_docx(src: Path, dst: Path):
 # -------------------------------------------------------------
 # 4. Hybrid Routers & Office Engines
 # -------------------------------------------------------------
+def validate_gemini_connection(api_key: str = None) -> tuple[bool, str]:
+    """Validate connection to Gemini API by sending a minimal test ping."""
+    key = get_gemini_api_key() if api_key is None else api_key
+    if not key:
+        return False, t("ai_err_no_key")
+    try:
+        from google import genai
+        client = genai.Client(api_key=key)
+        err = None
+        for m in ["gemini-flash-latest", "gemini-3.6-flash"]:
+            try:
+                client.models.generate_content(model=m, contents="ping")
+                return True, t("ai_connect_success")
+            except Exception as e:
+                err = str(e)
+        return False, err or "Connection failed"
+    except Exception as e:
+        return False, str(e)
+
+def convert_pdf_with_ai(src: Path, dst: Path):
+    """Dedicated Gemini Vision AI converter with upfront connection validation."""
+    print(t("validating_ai"))
+    ok, msg = validate_gemini_connection()
+    if not ok:
+        print(t("ai_connect_failed", error=msg))
+        print(t("falling_back_tesseract"))
+        pdf_tesseract_to_docx(src, dst)
+        return
+
+    print(t("ai_connect_success"))
+    if not is_scanned_pdf(src):
+        print(t("detected_vector_pdf"))
+        pdf_layout_to_docx(src, dst)
+        return
+
+    api_key = get_gemini_api_key()
+    pdf_vision_ai_to_docx(src, dst, api_key)
+
 def convert_pdf_hybrid(src: Path, dst: Path):
     if not is_scanned_pdf(src):
         print(t("detected_vector_pdf"))
@@ -367,42 +411,64 @@ def convert_pdf_hybrid(src: Path, dst: Path):
     print(t("detected_scanned_pdf"))
     api_key = get_gemini_api_key()
     if api_key:
-        pdf_vision_ai_to_docx(src, dst, api_key)
+        print(t("validating_ai"))
+        ok, msg = validate_gemini_connection(api_key)
+        if ok:
+            print(t("ai_connect_success"))
+            pdf_vision_ai_to_docx(src, dst, api_key)
+            return
+        else:
+            print(t("ai_connect_failed", error=msg))
+            print(t("falling_back_tesseract"))
     else:
         print(t("hint_no_api_key"))
-        pdf_tesseract_to_docx(src, dst)
 
-def image_to_docx_hybrid(src: Path, dst: Path):
+    pdf_tesseract_to_docx(src, dst)
+
+def image_to_docx_ai(src: Path, dst: Path):
+    """Convert image to docx via Gemini Vision AI with connection check."""
+    print(t("validating_ai"))
+    ok, msg = validate_gemini_connection()
+    if not ok:
+        print(t("ai_connect_failed", error=msg))
+        print(t("falling_back_tesseract"))
+        image_to_docx_tesseract(src, dst)
+        return
+
+    print(t("ai_connect_success"))
     with open(src, "rb") as f:
         img_bytes = f.read()
 
-    api_key = get_gemini_api_key()
-    if api_key:
-        import docx
-        from docx.shared import Inches
-        print(t("running_vision_ai"))
-        doc_out = docx.Document()
-        for sec in doc_out.sections:
-            sec.top_margin = Inches(1)
-            sec.bottom_margin = Inches(1)
-            sec.left_margin = Inches(1)
-            sec.right_margin = Inches(1)
-        md_text = process_page_with_vision_ai(img_bytes, api_key)
-        render_markdown_to_docx(md_text, doc_out)
-        doc_out.save(str(dst))
-    else:
-        import docx
-        from docx.shared import Inches
-        print(t("running_tesseract"))
-        doc_out = docx.Document()
-        for sec in doc_out.sections:
-            sec.top_margin = Inches(1)
-            sec.bottom_margin = Inches(1)
-            sec.left_margin = Inches(1)
-            sec.right_margin = Inches(1)
-        elements = extract_page_layout_tesseract(img_bytes, TESSERACT_CMD)
-        render_tesseract_elements_to_docx(doc_out, elements)
-        doc_out.save(str(dst))
+    import docx
+    from docx.shared import Inches
+    print(t("running_vision_ai"))
+    doc_out = docx.Document()
+    for sec in doc_out.sections:
+        sec.top_margin = Inches(1)
+        sec.bottom_margin = Inches(1)
+        sec.left_margin = Inches(1)
+        sec.right_margin = Inches(1)
+    md_text = process_page_with_vision_ai(img_bytes, get_gemini_api_key())
+    render_markdown_to_docx(md_text, doc_out)
+    save_docx_safely(doc_out, dst)
+
+def image_to_docx_tesseract(src: Path, dst: Path):
+    """Convert image to docx using local offline Tesseract OCR."""
+    with open(src, "rb") as f:
+        img_bytes = f.read()
+
+    import docx
+    from docx.shared import Inches
+    print(t("running_tesseract"))
+    doc_out = docx.Document()
+    for sec in doc_out.sections:
+        sec.top_margin = Inches(1)
+        sec.bottom_margin = Inches(1)
+        sec.left_margin = Inches(1)
+        sec.right_margin = Inches(1)
+    elements = extract_page_layout_tesseract(img_bytes, TESSERACT_CMD)
+    render_tesseract_elements_to_docx(doc_out, elements)
+    save_docx_safely(doc_out, dst)
 
 def docx_to_pdf(src: Path, dst: Path):
     from docx2pdf import convert as d2p
@@ -413,6 +479,7 @@ def get_converter_options(ext: str):
     ext = ext.lower()
     if ext == ".pdf":
         return [
+            ("mode_pdf_ai", "docx", convert_pdf_with_ai),
             ("mode_pdf_hybrid", "docx", convert_pdf_hybrid),
             ("mode_pdf_tesseract", "docx", pdf_tesseract_to_docx),
         ]
@@ -422,6 +489,7 @@ def get_converter_options(ext: str):
         ]
     elif ext in [".png", ".jpg", ".jpeg"]:
         return [
-            ("mode_image_docx", "docx", image_to_docx_hybrid),
+            ("mode_image_ai", "docx", image_to_docx_ai),
+            ("mode_image_tesseract", "docx", image_to_docx_tesseract),
         ]
     return []

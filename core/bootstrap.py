@@ -57,6 +57,8 @@ ENV_PATH = REPO_DIR / ".env"
 
 if ENV_PATH.exists():
     load_dotenv(dotenv_path=ENV_PATH)
+elif (REPO_DIR / ".env.example").exists():
+    load_dotenv(dotenv_path=REPO_DIR / ".env.example")
 
 if TESSDATA_DIR.exists():
     os.environ["TESSDATA_PREFIX"] = str(TESSDATA_DIR)
@@ -73,4 +75,14 @@ if not TESSERACT_CMD and sys.platform == "win32":
             break
 
 def get_gemini_api_key():
-    return os.environ.get("GEMINI_API_KEY", "").strip()
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not key or key == "your_api_key_here":
+        for p in [ENV_PATH, REPO_DIR / ".env.example"]:
+            if p.exists():
+                for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    if line.strip().startswith("GEMINI_API_KEY="):
+                        val = line.split("=", 1)[1].strip()
+                        if val and val != "your_api_key_here":
+                            return val
+        return ""
+    return key
