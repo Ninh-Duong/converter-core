@@ -9,10 +9,17 @@ venv/
 ENV/
 env/
 
-# Environment Variables & Secrets
+# Environment Variables & Secrets (Gemini API Key, Tokens & Credentials)
 .env
-.env.local
+.env.*
+*.env
 *.key
+*api_key*
+*apikey*
+*gemini*key*
+gemini*.txt
+credentials.json
+secrets/
 
 # User conversion files (prevent uploading private documents)
 files/*
