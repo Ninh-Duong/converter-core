@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Environment Variables & Secrets
+.env
+.env.local
+*.key
+
+# User conversion files (prevent uploading private documents)
+files/*
+!files/.gitkeep
+
+# Temporary Office Lock files
+~$*
+
+# OS generated files
+.DS_Store
+Thumbs.db
+*.tmp
+*.log
+
+# Build / Distribution
+dist/
+build/
+*.spec
