@@ -4,7 +4,7 @@ Converter Core - Main Entry Point
 Lightweight CLI runner coordinating multi-format document conversion.
 """
 
-from core.bootstrap import FILES_DIR, DOCS_DIR, IMGS_DIR
+from core.bootstrap import FILES_DIR, DOCS_DIR, IMGS_DIR, TESSERACT_CMD
 from core.i18n import t, toggle_language, get_language
 from core.engines import get_converter_options
 
@@ -39,21 +39,33 @@ def select_category(categories):
 
         print(t("invalid_choice", count=len(categories)))
 
-def select_file(files):
+def select_files(files):
     while True:
         prompt = t("select_file", count=len(files))
         choice = input(prompt).strip().lower()
 
         if choice == "q":
-            return None
+            return []
         if choice == "l":
             new_lang = toggle_language()
             print(t("language_switched", lang=new_lang.upper()))
             continue
         if choice == "":
-            return files[0]
-        if choice.isdigit() and 1 <= int(choice) <= len(files):
-            return files[int(choice) - 1]
+            return [files[0]]
+        if choice in ("a", "all", "*"):
+            return list(files)
+
+        indices = []
+        for part in choice.replace(",", " ").split():
+            if "-" in part:
+                s, _, e = part.partition("-")
+                if s.isdigit() and e.isdigit():
+                    indices.extend(range(int(s), int(e) + 1))
+            elif part.isdigit():
+                indices.append(int(part))
+
+        if indices and all(1 <= i <= len(files) for i in indices):
+            return [files[i - 1] for i in dict.fromkeys(indices)]
 
         print(t("invalid_choice", count=len(files)))
 
@@ -92,33 +104,45 @@ def main():
     for idx, f in enumerate(files, 1):
         print(f"[{idx}] {f.name}")
 
-    src_file = select_file(files)
-    if not src_file:
+    src_files = select_files(files)
+    if not src_files:
         return
 
-    options = get_converter_options(src_file.suffix)
+    options = get_converter_options(src_files[0].suffix)
     if not options:
-        print(t("unsupported", ext=src_file.suffix))
+        print(t("unsupported", ext=src_files[0].suffix))
+        return
+
+    incompatible = [f.name for f in src_files if get_converter_options(f.suffix) != options]
+    if incompatible:
+        print(t("mixed_formats"))
         return
 
     selected_opt = select_mode(options)
     if not selected_opt:
         return
 
-    _, target_ext, convert_fn = selected_opt
+    mode_key, target_ext, convert_fn = selected_opt
+    if "tesseract" in mode_key and not TESSERACT_CMD:
+        print(f"\n{t('tesseract_not_found')}")
+        return
 
-    # Clean double extensions (e.g., file.docx.docx)
-    base_name = src_file.stem
-    if base_name.endswith(".docx") and target_ext == "docx":
-        base_name = base_name[:-5]
+    for idx, src_file in enumerate(src_files, 1):
+        # Clean double extensions (e.g., file.docx.docx)
+        base_name = src_file.stem
+        if base_name.endswith(".docx") and target_ext == "docx":
+            base_name = base_name[:-5]
 
-    dst_file = src_file.parent / f"{base_name}.{target_ext}"
-    if target_ext == "txt":
-        print(t("extracting_text", src=src_file.name, dst=dst_file.name))
-    else:
-        print(t("converting", src=src_file.name, dst=dst_file.name))
-    convert_fn(src_file, dst_file)
-    print(t("done", path=dst_file))
+        dst_file = src_file.parent / f"{base_name}.{target_ext}"
+        if len(src_files) > 1:
+            print(f"\n[{idx}/{len(src_files)}] {src_file.name}")
+        if target_ext == "txt":
+            print(t("extracting_text", src=src_file.name, dst=dst_file.name))
+        else:
+            print(t("converting", src=src_file.name, dst=dst_file.name))
+        convert_fn(src_file, dst_file)
+        if dst_file.exists():
+            print(t("done", path=dst_file))
 
 if __name__ == "__main__":
     main()

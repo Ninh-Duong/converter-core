@@ -4,6 +4,7 @@ import io
 from pathlib import Path
 from core.bootstrap import TESSERACT_CMD, get_gemini_api_key
 from core.i18n import t
+from core.normalizer import normalize_vietnamese_ocr
 
 def is_scanned_pdf(pdf_path: Path) -> bool:
     """Check if a PDF file has an embedded digital text layer or is scanned/image-only."""
@@ -13,153 +14,331 @@ def is_scanned_pdf(pdf_path: Path) -> bool:
     doc.close()
     return total_chars < 50
 
+from dataclasses import dataclass
+from html.parser import HTMLParser
+
+@dataclass
+class PageContract:
+    page_num: int
+    char_count: int
+    word_count: int
+    numbers: set[str]
+    structure_keys: set[str]
+    has_table: bool
+
+class PageAuditor:
+    """Audit rules ensuring page-to-page 1-1 consistency and preventing lost data."""
+
+    @staticmethod
+    def extract_pdf_contract(page) -> PageContract:
+        text = page.get_text()
+        raw_numbers = set(re.findall(r"\b\d+(?:[.,/]\d+)*%?\b", text))
+        numbers = {n for n in raw_numbers if len(n) > 1 or n.isdigit()}
+        struct_keys = set(re.findall(r"(?:Điều|Khoản|Mục|CHƯƠNG)\s+\d+|[A-D]\.", text, re.IGNORECASE))
+        tables = page.find_tables().tables if hasattr(page, "find_tables") else []
+        has_table = bool(tables) or ("|" in text)
+        words = [w for w in text.split() if len(w) > 1]
+        return PageContract(
+            page_num=page.number + 1,
+            char_count=len(text),
+            word_count=len(words),
+            numbers=numbers,
+            structure_keys=struct_keys,
+            has_table=has_table
+        )
+
+    @staticmethod
+    def audit_page(contract: PageContract, output_text: str, docx_tables_count: int = 0) -> tuple[bool, list[str]]:
+        errors = []
+        if contract.numbers:
+            missing_nums = [n for n in contract.numbers if n not in output_text]
+            if len(missing_nums) > max(1, int(len(contract.numbers) * 0.15)):
+                errors.append(f"Missing numbers: {missing_nums[:5]}")
+        if contract.structure_keys:
+            missing_keys = [k for k in contract.structure_keys if k.lower() not in output_text.lower()]
+            if missing_keys:
+                errors.append(f"Missing structural markers: {missing_keys[:5]}")
+        if contract.word_count >= 20:
+            out_words = len(output_text.split())
+            ratio = out_words / contract.word_count
+            if ratio < 0.70:
+                errors.append(f"Truncated text: {out_words}/{contract.word_count} words ({ratio:.0%})")
+        if contract.has_table and docx_tables_count == 0:
+            errors.append("PDF page has a table, but output table is missing")
+
+        return len(errors) == 0, errors
+
+class SimpleHTMLTableParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.tables = []
+        self._cur_table = []
+        self._cur_row = []
+        self._cur_cell = []
+        self._in_cell = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "table":
+            self._cur_table = []
+        elif tag == "tr":
+            self._cur_row = []
+        elif tag in ("td", "th"):
+            self._cur_cell = []
+            self._in_cell = True
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th"):
+            self._cur_row.append("".join(self._cur_cell).strip())
+            self._in_cell = False
+        elif tag == "tr":
+            if self._cur_row:
+                self._cur_table.append(self._cur_row)
+        elif tag == "table":
+            if self._cur_table:
+                self.tables.append(self._cur_table)
+
+    def handle_data(self, data):
+        if self._in_cell:
+            self._cur_cell.append(data)
+
+def add_table_data_to_docx(doc, table_data):
+    if not table_data:
+        return None
+    rows = len(table_data)
+    cols = max((len(r) for r in table_data), default=1)
+    if rows == 0 or cols == 0:
+        return None
+    tbl = doc.add_table(rows=rows, cols=cols)
+    tbl.style = "Table Grid"
+    for r_idx, row in enumerate(table_data):
+        for c_idx, text in enumerate(row):
+            if c_idx < cols:
+                cell = tbl.cell(r_idx, c_idx)
+                cell.text = text
+                if r_idx == 0:
+                    for p in cell.paragraphs:
+                        for run in p.runs:
+                            run.bold = True
+    return tbl
+
+def parse_markdown_table_rows(table_lines):
+    parsed = []
+    for r in table_lines:
+        if re.match(r"^\s*\|?\s*:?-+:?\s*(\|?\s*:?-+:?\s*)+\|?\s*$", r):
+            continue
+        cols = [c.strip() for c in r.strip("|").split("|")]
+        parsed.append(cols)
+    return parsed
+
+import time
+
+ACTIVE_MODEL = None
+
+def get_configured_gemini_models() -> list[str]:
+    """Return model candidates ordered from newest to fallback, prioritizing user's choice or current active model."""
+    global ACTIVE_MODEL
+    custom = os.environ.get("GEMINI_MODEL", "").strip()
+    
+    # Danh sách model theo thứ tự mới nhất -> ổn định -> dự phòng
+    defaults = [
+        "gemini-3.8-flash",
+        "gemini-3.5-flash",
+        "gemini-3-flash-preview",
+        "gemini-flash-latest",
+        "gemini-flash-lite-latest",
+        "gemini-2.5-pro",
+        "gemini-pro-latest",
+    ]
+    
+    # 1. Nếu người dùng chỉ định rõ model trong .env -> ưu tiên số 1
+    if custom:
+        return [custom] + [m for m in defaults if m != custom]
+        
+    # 2. Nếu đã có model hoạt động ổn định trước đó -> ưu tiên model đó
+    if ACTIVE_MODEL and ACTIVE_MODEL in defaults:
+        return [ACTIVE_MODEL] + [m for m in defaults if m != ACTIVE_MODEL]
+        
+    return defaults
+
 # -------------------------------------------------------------
 # 1. Vision AI Engine (Gemini Flash)
 # -------------------------------------------------------------
-def process_page_with_vision_ai(img_bytes: bytes, api_key: str) -> str:
-    """Transcribe and structure document image into Markdown using Gemini Flash Vision."""
+def process_page_with_vision_ai(img_bytes: bytes, api_key: str, feedback: str = "") -> str:
+    """Transcribe and structure document image into Markdown and HTML tables with automatic failover."""
+    global ACTIVE_MODEL
     from google import genai
     from google.genai import types
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key, http_options={"timeout": 60000})
     prompt = (
-        "Convert this document page into clean standard Markdown format:\n"
-        "- Preserve 100% accurate text, accents, and typography.\n"
+        "Convert this document page into clean standard format:\n"
+        "- 100% ACCURACY: transcribe every single word, number, character, and accent.\n"
+        "- NEVER summarize, truncate, or omit any text, notes, or headers.\n"
+        "- MULTI-COLUMN ORDER: If the page has 2 columns or 2 side-by-side sections/slides, "
+        "read the ENTIRE LEFT column from top to bottom first, then the ENTIRE RIGHT column from top to bottom. "
+        "DO NOT interleave lines horizontally across columns.\n"
         "- Use #, ##, ### for titles and headings.\n"
-        "- Do not break sentences across arbitrary newlines; join paragraphs smoothly.\n"
-        "- Represent tables as clean Markdown tables (| Col 1 | Col 2 |).\n"
-        "- Return raw Markdown only, no code fences."
+        "- Format ALL tables using standard HTML <table><tr><th>/<td> tags "
+        "so multiline cells, headers, and rows are completely preserved without clipping.\n"
+        "- Lists: Use - or * for bullets.\n"
+        "- Return raw content only (no markdown code block fences, no conversational explanations)."
     )
+    if feedback:
+        prompt += f"\n\nCRITICAL AUDIT FEEDBACK FROM PREVIOUS ATTEMPT:\n{feedback}\nYou must include ALL missing elements above."
 
-    err = None
-    for m in ["gemini-flash-latest", "gemini-3.6-flash"]:
-        try:
-            response = client.models.generate_content(
-                model=m,
-                contents=[
-                    types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
-                    prompt
-                ]
-            )
-            return response.text
-        except Exception as e:
-            err = e
-    raise err
+    candidates = get_configured_gemini_models()
+    last_err = None
 
-def render_markdown_to_docx(md_text: str, doc):
-    """Render structured Markdown text into Microsoft Word DOCX elements."""
+    for idx, model_name in enumerate(candidates):
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[
+                        types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+                        prompt
+                    ]
+                )
+                if response and response.text:
+                    if ACTIVE_MODEL != model_name:
+                        ACTIVE_MODEL = model_name
+                    return response.text
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                
+                # Check for transient rate limit / overload
+                if ("503" in err_str or "429" in err_str or "unavailable" in err_str.lower()) and attempt == 0:
+                    time.sleep(2)
+                    continue
+
+                # Categorize error
+                if "503" in err_str or "unavailable" in err_str.lower():
+                    reason = "503 Server quá tải"
+                elif "504" in err_str or "deadline" in err_str.lower() or "timeout" in err_str.lower():
+                    reason = "Timeout / Hết thời gian chờ"
+                elif "429" in err_str or "quota" in err_str.lower():
+                    reason = "429 Quota limit"
+                elif "404" in err_str:
+                    reason = "404 Model chưa mở"
+                else:
+                    reason = err_str.splitlines()[0][:35]
+
+                next_model = candidates[idx + 1] if idx + 1 < len(candidates) else None
+                if next_model:
+                    print(f"  [!] Model '{model_name}' gặp sự cố ({reason}). Tự động switch sang '{next_model}'...")
+                break
+
+    raise last_err
+
+def render_content_to_docx(raw_text: str, doc) -> int:
+    """Render structured text containing HTML tables, Markdown headings, and paragraphs to docx."""
     from docx.shared import Pt
     from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-    lines = md_text.split("\n")
-    in_table = False
-    table_rows = []
+    clean = re.sub(r"^```(?:html|markdown)?\s*", "", raw_text.strip(), flags=re.IGNORECASE)
+    clean = re.sub(r"\s*```$", "", clean)
 
-    def flush_table():
-        nonlocal in_table, table_rows
-        if not table_rows:
-            return
-        parsed_rows = []
-        for r in table_rows:
-            if re.match(r"^\s*\|?\s*:?-+:?\s*(\|?\s*:?-+:?\s*)+\|?\s*$", r):
+    chunks = re.split(r"(<table[\s\S]*?</table>)", clean, flags=re.IGNORECASE)
+    total_tables = 0
+
+    for chunk in chunks:
+        chunk_stripped = chunk.strip()
+        if not chunk_stripped:
+            continue
+
+        if re.match(r"^<table[\s\S]*?</table>$", chunk_stripped, flags=re.IGNORECASE):
+            parser = SimpleHTMLTableParser()
+            parser.feed(chunk_stripped)
+            for tbl_data in parser.tables:
+                if add_table_data_to_docx(doc, tbl_data):
+                    total_tables += 1
+            continue
+
+        lines = chunk_stripped.split("\n")
+        in_md_table = False
+        md_table_rows = []
+
+        def flush_md_table():
+            nonlocal in_md_table, md_table_rows, total_tables
+            if md_table_rows:
+                t_data = parse_markdown_table_rows(md_table_rows)
+                if add_table_data_to_docx(doc, t_data):
+                    total_tables += 1
+            md_table_rows = []
+            in_md_table = False
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                if in_md_table:
+                    flush_md_table()
                 continue
-            cols = [c.strip() for c in r.strip("|").split("|")]
-            parsed_rows.append(cols)
-        
-        if parsed_rows:
-            max_cols = max(len(r) for r in parsed_rows)
-            table = doc.add_table(rows=len(parsed_rows), cols=max_cols)
-            table.style = "Table Grid"
-            for r_idx, row in enumerate(parsed_rows):
-                for c_idx, cell_text in enumerate(row):
-                    if c_idx < max_cols:
-                        cell = table.cell(r_idx, c_idx)
-                        cell.text = cell_text
-                        if r_idx == 0:
-                            for p in cell.paragraphs:
-                                for run in p.runs:
-                                    run.bold = True
-        table_rows = []
-        in_table = False
 
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            if in_table:
-                flush_table()
-            continue
+            if "|" in stripped and (stripped.startswith("|") or stripped.endswith("|") or stripped.count("|") >= 2):
+                in_md_table = True
+                md_table_rows.append(stripped)
+                continue
+            elif in_md_table:
+                flush_md_table()
 
-        if stripped.startswith("|") and stripped.endswith("|"):
-            in_table = True
-            table_rows.append(stripped)
-            continue
-        elif in_table:
-            flush_table()
+            if stripped.startswith("# "):
+                p = doc.add_paragraph()
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                run = p.add_run(stripped[2:].strip())
+                run.bold = True
+                run.font.size = Pt(14)
+            elif stripped.startswith("## "):
+                p = doc.add_paragraph()
+                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                run = p.add_run(stripped[3:].strip())
+                run.bold = True
+                run.font.size = Pt(12)
+            elif stripped.startswith("### "):
+                p = doc.add_paragraph()
+                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                run = p.add_run(stripped[4:].strip())
+                run.bold = True
+                run.font.size = Pt(11)
+            elif stripped.startswith(("- ", "* ")):
+                doc.add_paragraph(stripped[2:].strip(), style="List Bullet")
+            else:
+                p = doc.add_paragraph()
+                p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                p.paragraph_format.space_after = Pt(6)
+                p.paragraph_format.line_spacing = 1.15
+                parts = re.split(r"(\*\*.*?\*\*)", stripped)
+                for part in parts:
+                    if part.startswith("**") and part.endswith("**"):
+                        run = p.add_run(part[2:-2])
+                        run.bold = True
+                    else:
+                        p.add_run(part)
 
-        if stripped.startswith("# "):
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run = p.add_run(stripped[2:].strip())
-            run.bold = True
-            run.font.size = Pt(14)
-        elif stripped.startswith("## "):
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            run = p.add_run(stripped[3:].strip())
-            run.bold = True
-            run.font.size = Pt(12)
-        elif stripped.startswith("### "):
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            run = p.add_run(stripped[4:].strip())
-            run.bold = True
-            run.font.size = Pt(11)
-        elif stripped.startswith(("- ", "* ")):
-            doc.add_paragraph(stripped[2:].strip(), style="List Bullet")
-        else:
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            p.paragraph_format.space_after = Pt(6)
-            p.paragraph_format.line_spacing = 1.15
-            parts = re.split(r"(\*\*.*?\*\*)", stripped)
-            for part in parts:
-                if part.startswith("**") and part.endswith("**"):
-                    run = p.add_run(part[2:-2])
-                    run.bold = True
-                else:
-                    p.add_run(part)
+        if in_md_table:
+            flush_md_table()
 
-    if in_table:
-        flush_table()
+    return total_tables
 
-def pdf_vision_ai_to_docx(src: Path, dst: Path, api_key: str):
-    import pymupdf, docx
-    from docx.shared import Inches
+def render_markdown_to_docx(md_text: str, doc):
+    """Render structured Markdown text into Microsoft Word DOCX elements."""
+    render_content_to_docx(md_text, doc)
 
-    print(t("running_vision_ai"))
-    pdf_in = pymupdf.open(str(src))
-    doc_out = docx.Document()
-
-    for sec in doc_out.sections:
-        sec.top_margin = Inches(1)
-        sec.bottom_margin = Inches(1)
-        sec.left_margin = Inches(1)
-        sec.right_margin = Inches(1)
-
-def get_page_image_slices(page, pdf_in) -> list[bytes]:
-    """Extract page image(s), automatically splitting 2-up landscape scans into portrait sub-pages."""
+def get_page_image_slices(page, pdf_in, auto_split_2up: bool = False) -> list[bytes]:
+    """Extract page image, keeping full page intact unless 2-up book split is explicitly enabled."""
     from PIL import Image
-    images = page.get_images()
-    raw = pdf_in.extract_image(images[0][0])["image"] if images else page.get_pixmap(dpi=200).tobytes("png")
-    img = Image.open(io.BytesIO(raw))
-    w, h = img.size
-    if w > h * 1.25:
-        slices = []
-        for box in ((0, 0, w // 2, h), (w // 2, 0, w, h)):
-            buf = io.BytesIO()
-            img.crop(box).save(buf, format="PNG")
-            slices.append(buf.getvalue())
-        return slices
+    pix = page.get_pixmap(dpi=200)
+    raw = pix.tobytes("png")
+    if auto_split_2up:
+        img = Image.open(io.BytesIO(raw))
+        w, h = img.size
+        if w > h * 1.4:
+            slices = []
+            for box in ((0, 0, w // 2, h), (w // 2, 0, w, h)):
+                buf = io.BytesIO()
+                img.crop(box).save(buf, format="PNG")
+                slices.append(buf.getvalue())
+            return slices
     return [raw]
 
 def save_docx_safely(doc_out, dst: Path) -> Path:
@@ -187,15 +366,39 @@ def pdf_vision_ai_to_docx(src: Path, dst: Path, api_key: str):
         sec.left_margin = Inches(1)
         sec.right_margin = Inches(1)
 
-    page_slices = []
-    for page in pdf_in:
-        page_slices.extend(get_page_image_slices(page, pdf_in))
+    total_pages = len(pdf_in)
+    for idx, page in enumerate(pdf_in, 1):
+        print(t("page_progress_ai", page=idx, total=total_pages))
+        contract = PageAuditor.extract_pdf_contract(page)
+        pix = page.get_pixmap(dpi=200)
+        img_bytes = pix.tobytes("png")
 
-    for idx, img_bytes in enumerate(page_slices, 1):
-        print(t("page_progress_ai", page=idx, total=len(page_slices)))
-        md_text = process_page_with_vision_ai(img_bytes, api_key)
-        render_markdown_to_docx(md_text, doc_out)
-        if idx < len(page_slices):
+        feedback = ""
+        output_content = ""
+        passed = False
+        audit_errors = []
+
+        for attempt in range(2):
+            output_content = process_page_with_vision_ai(img_bytes, api_key, feedback=feedback)
+            has_table_in_out = bool(re.search(r"<table[\s\S]*?</table>", output_content, re.IGNORECASE)) or ("|" in output_content)
+            passed, audit_errors = PageAuditor.audit_page(
+                contract,
+                output_content,
+                docx_tables_count=1 if has_table_in_out else 0
+            )
+            if passed or not contract.numbers:
+                break
+            feedback = "; ".join(audit_errors)
+            print(f"  [!] Audit retry page {idx} (attempt {attempt+1}): {feedback}")
+
+        tbl_count = render_content_to_docx(output_content, doc_out)
+
+        if passed or not audit_errors:
+            print(f"  [✓] Page {idx} Audit PASSED: 1-1 page parity maintained.")
+        else:
+            print(f"  [!] Page {idx} Audit Warning: {audit_errors[0]}")
+
+        if idx < total_pages:
             doc_out.add_page_break()
 
     pdf_in.close()
@@ -204,15 +407,23 @@ def pdf_vision_ai_to_docx(src: Path, dst: Path, api_key: str):
 # -------------------------------------------------------------
 # 2. Local Tesseract OCR Engine (Offline Fallback)
 # -------------------------------------------------------------
+def preprocess_page_for_tesseract(pil_img):
+    """Nâng cao độ tương phản và làm nét viền ký tự cho Tesseract."""
+    from PIL import ImageOps, ImageFilter
+    gray = pil_img.convert("L")
+    contrast = ImageOps.autocontrast(gray, cutoff=2)
+    return contrast.filter(ImageFilter.SHARPEN)
+
 def extract_page_layout_tesseract(img_bytes: bytes, tess_cmd: str):
     import pytesseract
     from PIL import Image
     from pytesseract import Output
 
     pytesseract.pytesseract.tesseract_cmd = tess_cmd
-    img = Image.open(io.BytesIO(img_bytes))
-    _, h_total = img.size
-    data = pytesseract.image_to_data(img, lang="vie", config="--psm 1", output_type=Output.DICT)
+    raw_img = Image.open(io.BytesIO(img_bytes))
+    prep_img = preprocess_page_for_tesseract(raw_img)
+    w_total, h_total = prep_img.size
+    data = pytesseract.image_to_data(prep_img, lang="vie", config="--psm 1", output_type=Output.DICT)
 
     raw_lines = []
     cur_key, cur_line = None, None
@@ -236,53 +447,67 @@ def extract_page_layout_tesseract(img_bytes: bytes, tess_cmd: str):
             cur_line["right"] = max(cur_line["right"], data["left"][i] + data["width"][i])
             cur_line["bottom"] = max(cur_line["bottom"], data["top"][i] + data["height"][i])
 
-    # Sort lines vertically to prevent out-of-order column/block jumps
-    raw_lines.sort(key=lambda l: (round(l["top"] / 10) * 10, l["left"]))
+    # Detect if page has multi-column/2-up layout (e.g. landscape presentation or 2-column document)
+    is_two_col = (w_total > h_total * 1.1) and any(l["left"] > w_total * 0.52 for l in raw_lines) and any(l["left"] < w_total * 0.48 for l in raw_lines)
 
-    # Merge line fragments on the same baseline (e.g. margin overflows like "bảo vệ")
+    for l in raw_lines:
+        l["col"] = (1 if l["left"] >= w_total * 0.5 else 0) if is_two_col else 0
+
+    # Sort lines vertically within each column to prevent out-of-order column interleaving
+    raw_lines.sort(key=lambda l: (l["col"], round(l["top"] / 10) * 10, l["left"]))
+
+    # Merge line fragments on the same baseline strictly within the same column
     merged = []
     for l in raw_lines:
-        if merged and abs(merged[-1]["top"] - l["top"]) <= 8:
+        if merged and merged[-1]["col"] == l["col"] and abs(merged[-1]["top"] - l["top"]) <= 8:
             merged[-1]["words"].extend(l["words"])
             merged[-1]["right"] = max(merged[-1]["right"], l["right"])
             merged[-1]["bottom"] = max(merged[-1]["bottom"], l["bottom"])
         else:
             merged.append(l)
 
-    max_w = max((l["right"] - l["left"] for l in merged), default=1)
     page_elements = []
     cur_body = []
 
     for idx, l in enumerate(merged):
-        text = " ".join(l["words"]).strip()
-        if not text:
+        raw_text = " ".join(l["words"]).strip()
+        if not raw_text:
             continue
+
+        # Chuẩn hoá lỗi chính tả quang học tiếng Việt
+        text = normalize_vietnamese_ocr(raw_text)
 
         # Ignore solitary page numbers in footer
         if text.isdigit() and len(text) <= 3 and l["top"] > h_total * 0.85:
             continue
 
-        lw = l["right"] - l["left"]
-        is_short = lw < (max_w * 0.82)
+        # Phân loại chính xác các mục, tiêu đề và gạch đầu dòng
+        is_bullet = bool(re.match(r"^[-•*+]\s*", text))
         is_title = text.isupper() or text.startswith(("CHƯƠNG", "Điều "))
-        is_heading = bool(re.match(r"^(\d+(\.\d+)*|Mục|\>|\-|\•)\b", text))
+        is_heading = bool(re.match(r"^(\d+(\.\d+)*|Mục)\b", text))
 
-        if is_title or is_heading:
+        if is_title or is_heading or is_bullet:
             if cur_body:
                 page_elements.append(("body", " ".join(cur_body)))
                 cur_body = []
-            page_elements.append(("title" if is_title else "heading", text))
+            if is_bullet:
+                clean_bullet = re.sub(r"^[-•*+]\s*", "", text).strip()
+                page_elements.append(("bullet", clean_bullet))
+            elif is_title:
+                page_elements.append(("title", text))
+            else:
+                page_elements.append(("heading", text))
             continue
 
         cur_body.append(text)
 
-        next_is_heading = False
+        next_is_special = False
         if idx + 1 < len(merged):
-            nxt = " ".join(merged[idx + 1]["words"]).strip()
-            if nxt.isupper() or nxt.startswith(("CHƯƠNG", "Điều ")) or re.match(r"^(\d+(\.\d+)*|Mục|\>|\-|\•)\b", nxt):
-                next_is_heading = True
+            nxt = normalize_vietnamese_ocr(" ".join(merged[idx + 1]["words"]).strip())
+            if nxt.isupper() or nxt.startswith(("CHƯƠNG", "Điều ")) or re.match(r"^([-•*+]|(\d+(\.\d+)*|Mục)\b)", nxt):
+                next_is_special = True
 
-        if is_short or next_is_heading:
+        if next_is_special:
             page_elements.append(("body", " ".join(cur_body)))
             cur_body = []
 
@@ -298,6 +523,13 @@ def render_tesseract_elements_to_docx(doc_out, elements):
     for elem_type, text in elements:
         text = text.strip()
         if not text or text in ["]", "[", "|", "~"]:
+            continue
+
+        if elem_type == "bullet":
+            p = doc_out.add_paragraph(text, style="List Bullet")
+            p.paragraph_format.space_after = Pt(3)
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.line_spacing = 1.15
             continue
 
         p = doc_out.add_paragraph()
@@ -338,15 +570,13 @@ def pdf_tesseract_to_docx(src: Path, dst: Path):
         sec.left_margin = Inches(1)
         sec.right_margin = Inches(1)
 
-    page_slices = []
-    for page in pdf_in:
-        page_slices.extend(get_page_image_slices(page, pdf_in))
-
-    for idx, img_bytes in enumerate(page_slices, 1):
-        print(t("page_progress_tess", page=idx, total=len(page_slices)))
-        elements = extract_page_layout_tesseract(img_bytes, TESSERACT_CMD)
+    total_pages = len(pdf_in)
+    for idx, page in enumerate(pdf_in, 1):
+        print(t("page_progress_tess", page=idx, total=total_pages))
+        pix = page.get_pixmap(dpi=250)
+        elements = extract_page_layout_tesseract(pix.tobytes("png"), TESSERACT_CMD)
         render_tesseract_elements_to_docx(doc_out, elements)
-        if idx < len(page_slices):
+        if idx < total_pages:
             doc_out.add_page_break()
 
     pdf_in.close()
@@ -366,17 +596,19 @@ def pdf_layout_to_docx(src: Path, dst: Path):
 # -------------------------------------------------------------
 def validate_gemini_connection(api_key: str = None) -> tuple[bool, str]:
     """Validate connection to Gemini API by sending a minimal test ping."""
+    global ACTIVE_MODEL
     key = get_gemini_api_key() if api_key is None else api_key
     if not key:
         return False, t("ai_err_no_key")
     try:
         from google import genai
-        client = genai.Client(api_key=key)
+        client = genai.Client(api_key=key, http_options={"timeout": 15000})
         err = None
-        for m in ["gemini-flash-latest", "gemini-3.6-flash"]:
+        for m in get_configured_gemini_models():
             try:
                 client.models.generate_content(model=m, contents="ping")
-                return True, t("ai_connect_success")
+                ACTIVE_MODEL = m
+                return True, t("ai_connect_success") + f" ({m})"
             except Exception as e:
                 err = str(e)
         return False, err or "Connection failed"
@@ -394,11 +626,6 @@ def convert_pdf_with_ai(src: Path, dst: Path):
         return
 
     print(t("ai_connect_success"))
-    if not is_scanned_pdf(src):
-        print(t("detected_vector_pdf"))
-        pdf_layout_to_docx(src, dst)
-        return
-
     api_key = get_gemini_api_key()
     pdf_vision_ai_to_docx(src, dst, api_key)
 

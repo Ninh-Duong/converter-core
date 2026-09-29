@@ -85,16 +85,90 @@ elif (REPO_DIR / ".env.example").exists():
 if TESSDATA_DIR.exists():
     os.environ["TESSDATA_PREFIX"] = str(TESSDATA_DIR)
 
-TESSERACT_CMD = shutil.which("tesseract")
-if not TESSERACT_CMD and sys.platform == "win32":
-    for candidate in [
-        Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
-        Path(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),
-        REPO_DIR / "tesseract" / "tesseract.exe",
-    ]:
-        if candidate.exists():
-            TESSERACT_CMD = str(candidate)
-            break
+def find_tesseract():
+    cmd = shutil.which("tesseract")
+    if cmd:
+        return cmd
+    if sys.platform == "win32":
+        for candidate in [
+            Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
+            Path(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),
+            REPO_DIR / "tesseract" / "tesseract.exe",
+        ]:
+            if candidate.exists():
+                return str(candidate)
+    return None
+
+def ensure_tesseract():
+    """Ensure Tesseract OCR binary is available, auto-installing if missing."""
+    cmd = find_tesseract()
+    if cmd:
+        return cmd
+
+    print("\n" + "=" * 60)
+    print("[SETUP] First run detected: Missing Tesseract OCR binary.")
+    print("[SETUP] Automatically installing Tesseract OCR...")
+    print("=" * 60)
+
+    if sys.platform == "win32":
+        winget = shutil.which("winget")
+        if winget:
+            try:
+                subprocess.run(
+                    [
+                        winget, "install", "--id", "UB-Mannheim.TesseractOCR",
+                        "--accept-source-agreements", "--accept-package-agreements",
+                        "--silent"
+                    ],
+                    check=True
+                )
+                cmd = find_tesseract()
+                if cmd:
+                    print("[SETUP] Tesseract OCR installed successfully!\n")
+                    return cmd
+            except Exception as e:
+                print(f"[SETUP] Winget install notice: {e}")
+
+        # Fallback: Download official UB-Mannheim installer to REPO_DIR / "tesseract"
+        try:
+            import urllib.request
+            installer_url = "https://github.com/UB-Mannheim/tesseract/releases/download/v5.4.0.20240606/tesseract-ocr-w64-setup-5.4.0.20240606.exe"
+            tmp_installer = REPO_DIR / "tesseract_setup.exe"
+            target_dir = REPO_DIR / "tesseract"
+            print("[SETUP] Downloading standalone Tesseract installer...")
+            urllib.request.urlretrieve(installer_url, str(tmp_installer))
+            print(f"[SETUP] Unpacking to {target_dir}...")
+            subprocess.run([str(tmp_installer), "/S", f"/D={target_dir}"], check=True)
+            if tmp_installer.exists():
+                tmp_installer.unlink()
+            cmd = find_tesseract()
+            if cmd:
+                print("[SETUP] Tesseract OCR standalone installed successfully!\n")
+                return cmd
+        except Exception as e:
+            print(f"[SETUP] Direct download notice: {e}")
+
+    elif sys.platform.startswith("linux"):
+        if shutil.which("apt-get"):
+            try:
+                subprocess.run(["apt-get", "update", "-qq"], check=True)
+                subprocess.run(["apt-get", "install", "-y", "tesseract-ocr", "tesseract-ocr-vie"], check=True)
+                return find_tesseract()
+            except Exception:
+                pass
+    elif sys.platform == "darwin":
+        if shutil.which("brew"):
+            try:
+                subprocess.run(["brew", "install", "tesseract", "tesseract-lang"], check=True)
+                return find_tesseract()
+            except Exception:
+                pass
+
+    print("[SETUP] Notice: Could not auto-install Tesseract. Offline OCR may be unavailable.")
+    print("=" * 60 + "\n")
+    return None
+
+TESSERACT_CMD = ensure_tesseract()
 
 def get_gemini_api_key():
     key = os.environ.get("GEMINI_API_KEY", "").strip()

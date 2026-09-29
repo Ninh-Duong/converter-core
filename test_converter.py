@@ -105,19 +105,64 @@ class TestConverterCore(unittest.TestCase):
                 tmp_path.unlink()
 
     def test_landscape_slice_splitting(self):
-        """Ensure landscape pages (>1.25 aspect ratio) split into 2 sub-pages and portrait remain 1."""
+        """Ensure landscape pages remain 1 slice by default to protect tables, and split only if auto_split_2up=True."""
         from core.engines import get_page_image_slices
-        # Landscape document (800 x 400, aspect ratio 2.0)
         doc = pymupdf.open()
         p_land = doc.new_page(width=800, height=400)
-        slices_land = get_page_image_slices(p_land, doc)
-        self.assertEqual(len(slices_land), 2, "Landscape page must split into 2 slices.")
+        # Default: keep 1-1 intact page to protect tables
+        self.assertEqual(len(get_page_image_slices(p_land, doc)), 1, "Default must preserve full landscape page.")
+        # When 2-up scan splitting is explicitly enabled
+        self.assertEqual(len(get_page_image_slices(p_land, doc, auto_split_2up=True)), 2, "2-up split must yield 2 slices.")
 
-        # Portrait document (400 x 600, aspect ratio 0.67)
         p_port = doc.new_page(width=400, height=600)
-        slices_port = get_page_image_slices(p_port, doc)
-        self.assertEqual(len(slices_port), 1, "Portrait page must remain 1 slice.")
+        self.assertEqual(len(get_page_image_slices(p_port, doc)), 1, "Portrait page must remain 1 slice.")
         doc.close()
+
+    def test_html_table_rendering(self):
+        """Verify HTML table parsing into Word table with rows and cells."""
+        from core.engines import render_content_to_docx
+        doc = docx.Document()
+        html_content = (
+            "# Báo cáo\n"
+            "<table>\n"
+            "  <tr><th>Mã</th><th>Tên</th><th>Điểm</th></tr>\n"
+            "  <tr><td>001</td><td>Nguyễn Văn A</td><td>9.5</td></tr>\n"
+            "</table>\n"
+            "Đoạn văn kết thúc."
+        )
+        total_tables = render_content_to_docx(html_content, doc)
+        self.assertEqual(total_tables, 1)
+        self.assertEqual(len(doc.tables), 1)
+        self.assertEqual(len(doc.tables[0].rows), 2)
+        self.assertEqual(doc.tables[0].cell(0, 0).text, "Mã")
+        self.assertEqual(doc.tables[0].cell(1, 1).text, "Nguyễn Văn A")
+
+    def test_page_auditor_rules(self):
+        """Test PageAuditor validation rules: missing numbers, missing tables, and word count retention."""
+        from core.engines import PageContract, PageAuditor
+        contract = PageContract(
+            page_num=1,
+            char_count=100,
+            word_count=14,
+            numbers={"2024", "10", "100%"},
+            structure_keys={"Điều 1"},
+            has_table=True
+        )
+
+        # 1. Output missing numbers & table -> should FAIL
+        passed, errors = PageAuditor.audit_page(contract, "Đây là văn bản thiếu số và bảng.", docx_tables_count=0)
+        self.assertFalse(passed)
+        self.assertTrue(any("Missing numbers" in e for e in errors))
+        self.assertTrue(any("output table is missing" in e for e in errors))
+
+        # 2. Output with full numbers, keys & table -> should PASS
+        passed, errors = PageAuditor.audit_page(
+            contract,
+            "Nội dung Điều 1 theo quy định năm 2024, số lượng 10 và tỷ lệ 100%.",
+            docx_tables_count=1
+        )
+        self.assertTrue(passed)
+        self.assertEqual(errors, [])
 
     def test_validate_gemini_connection_empty(self):
         """Test that validation fails gracefully when no API key is provided."""
@@ -144,6 +189,47 @@ class TestConverterCore(unittest.TestCase):
             self.assertTrue(txt_path.exists())
             self.assertIn("HELLO", txt_path.read_text(encoding="utf-8").strip())
 
+    def test_normalize_vietnamese_ocr(self):
+        """Ensure optical confusion errors from Tesseract are corrected."""
+        from core.normalizer import normalize_vietnamese_ocr
+
+        # Known Tesseract optical errors reported by user
+        corrupted = "QUY TẮC Đạo ùxc HÀNH nghê CỦA CCV Theo Hiển Map và công dumg chuân mực nghệ nghiệp"
+        expected = "QUY TẮC Đạo đức HÀNH nghề CỦA CCV Theo Hiến pháp và công chứng chuẩn mực nghề nghiệp"
+        self.assertEqual(normalize_vietnamese_ocr(corrupted), expected)
+
+        # Artifact cleaning
+        self.assertEqual(normalize_vietnamese_ocr("- . Bảo vệ quyền lợi"), "- Bảo vệ quyền lợi")
+        self.assertEqual(normalize_vietnamese_ocr("'Hoạt động công chứng"), "Hoạt động công chứng")
+
+    def test_render_tesseract_bullet_elements(self):
+        """Verify that bullet elements are rendered as List Bullet paragraphs in docx."""
+        from core.engines import render_tesseract_elements_to_docx
+        doc = docx.Document()
+        elements = [
+            ("title", "TIÊU ĐỀ BÀI VIẾT"),
+            ("bullet", "Bảo vệ quyền, lợi ích hợp pháp của người yêu cầu"),
+            ("bullet", "Tôn trọng quyền tự do ý chí"),
+            ("body", "Đoạn văn giải thích chi tiết."),
+        ]
+        render_tesseract_elements_to_docx(doc, elements)
+
+        self.assertEqual(len(doc.paragraphs), 4)
+        self.assertEqual(doc.paragraphs[0].text, "TIÊU ĐỀ BÀI VIẾT")
+        self.assertEqual(doc.paragraphs[1].style.name, "List Bullet")
+        self.assertEqual(doc.paragraphs[1].text, "Bảo vệ quyền, lợi ích hợp pháp của người yêu cầu")
+        self.assertEqual(doc.paragraphs[2].style.name, "List Bullet")
+        self.assertEqual(doc.paragraphs[3].text, "Đoạn văn giải thích chi tiết.")
+
+    def test_gemini_models_failover_ordering(self):
+        """Verify dynamic failover model list is non-empty and starts with newest models."""
+        from core.engines import get_configured_gemini_models
+        models = get_configured_gemini_models()
+        self.assertGreaterEqual(len(models), 3)
+        self.assertIn("gemini-3.8-flash", models)
+        self.assertIn("gemini-3.5-flash", models)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
