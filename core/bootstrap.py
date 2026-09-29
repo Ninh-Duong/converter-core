@@ -21,9 +21,15 @@ REQUIRED_PACKAGES = [
     ("google.genai", "google-genai"),
 ]
 
+def _is_missing(mod):
+    try:
+        return importlib.util.find_spec(mod) is None
+    except ModuleNotFoundError:
+        return True
+
 def ensure_dependencies():
     """Auto-check and install missing packages on first run."""
-    missing = [pkg for mod, pkg in REQUIRED_PACKAGES if importlib.util.find_spec(mod) is None]
+    missing = [pkg for mod, pkg in REQUIRED_PACKAGES if _is_missing(mod)]
     if missing:
         print("\n" + "=" * 60)
         print("[SETUP] First run detected: Missing required dependencies.")
