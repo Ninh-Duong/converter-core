@@ -1,10 +1,14 @@
 import os
 import re
 import io
+import logging
 from pathlib import Path
 from core.bootstrap import TESSERACT_CMD, get_gemini_api_key
 from core.i18n import t
 from core.normalizer import normalize_vietnamese_ocr
+
+# Suppress noisy AFC internal warning from google-genai SDK
+logging.getLogger("google_genai.models").setLevel(logging.ERROR)
 
 def is_scanned_pdf(pdf_path: Path) -> bool:
     """Check if a PDF file has an embedded digital text layer or is scanned/image-only."""
@@ -35,7 +39,7 @@ class PageAuditor:
         raw_numbers = set(re.findall(r"\b\d+(?:[.,/]\d+)*%?\b", text))
         numbers = {n for n in raw_numbers if len(n) > 1 or n.isdigit()}
         struct_keys = set(re.findall(r"(?:Điều|Khoản|Mục|CHƯƠNG)\s+\d+|[A-D]\.", text, re.IGNORECASE))
-        tables = page.find_tables().tables if hasattr(page, "find_tables") else []
+        tables = page.find_tables().tables if (hasattr(page, "find_tables") and text.strip()) else []
         has_table = bool(tables) or ("|" in text)
         words = [w for w in text.split() if len(w) > 1]
         return PageContract(
@@ -139,15 +143,14 @@ def get_configured_gemini_models() -> list[str]:
     global ACTIVE_MODEL
     custom = os.environ.get("GEMINI_MODEL", "").strip()
     
-    # Danh sách model theo thứ tự mới nhất -> ổn định -> dự phòng
+    # Danh sách model theo thứ tự: nhanh/ổn định/quota cao -> dự phòng
     defaults = [
+        "gemini-flash-lite-latest",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-flash-latest",
         "gemini-3.8-flash",
         "gemini-3.5-flash",
-        "gemini-3-flash-preview",
-        "gemini-flash-latest",
-        "gemini-flash-lite-latest",
-        "gemini-2.5-pro",
-        "gemini-pro-latest",
     ]
     
     # 1. Nếu người dùng chỉ định rõ model trong .env -> ưu tiên số 1
@@ -207,9 +210,9 @@ def process_page_with_vision_ai(img_bytes: bytes, api_key: str, feedback: str = 
                 last_err = e
                 err_str = str(e)
                 
-                # Check for transient rate limit / overload
-                if ("503" in err_str or "429" in err_str or "unavailable" in err_str.lower()) and attempt == 0:
-                    time.sleep(2)
+                # Check for transient server overload (503 only; 429 quota will not clear in 2s)
+                if ("503" in err_str or "unavailable" in err_str.lower()) and attempt == 0:
+                    time.sleep(1)
                     continue
 
                 # Categorize error
@@ -220,7 +223,7 @@ def process_page_with_vision_ai(img_bytes: bytes, api_key: str, feedback: str = 
                 elif "429" in err_str or "quota" in err_str.lower():
                     reason = "429 Quota limit"
                 elif "404" in err_str:
-                    reason = "404 Model chưa mở"
+                    reason = "404 Model không khả dụng"
                 else:
                     reason = err_str.splitlines()[0][:35]
 
@@ -602,13 +605,13 @@ def validate_gemini_connection(api_key: str = None) -> tuple[bool, str]:
         return False, t("ai_err_no_key")
     try:
         from google import genai
-        client = genai.Client(api_key=key, http_options={"timeout": 15000})
+        client = genai.Client(api_key=key, http_options={"timeout": 10000})
         err = None
         for m in get_configured_gemini_models():
             try:
                 client.models.generate_content(model=m, contents="ping")
                 ACTIVE_MODEL = m
-                return True, t("ai_connect_success") + f" ({m})"
+                return True, t("ai_connect_success", model=m)
             except Exception as e:
                 err = str(e)
         return False, err or "Connection failed"
@@ -625,9 +628,14 @@ def convert_pdf_with_ai(src: Path, dst: Path):
         pdf_tesseract_to_docx(src, dst)
         return
 
-    print(t("ai_connect_success"))
+    print(msg)
     api_key = get_gemini_api_key()
-    pdf_vision_ai_to_docx(src, dst, api_key)
+    try:
+        pdf_vision_ai_to_docx(src, dst, api_key)
+    except Exception as e:
+        print(f"\n[!] Vision AI error: {e}")
+        print(t("falling_back_tesseract"))
+        pdf_tesseract_to_docx(src, dst)
 
 def convert_pdf_hybrid(src: Path, dst: Path):
     if not is_scanned_pdf(src):
@@ -641,9 +649,13 @@ def convert_pdf_hybrid(src: Path, dst: Path):
         print(t("validating_ai"))
         ok, msg = validate_gemini_connection(api_key)
         if ok:
-            print(t("ai_connect_success"))
-            pdf_vision_ai_to_docx(src, dst, api_key)
-            return
+            print(msg)
+            try:
+                pdf_vision_ai_to_docx(src, dst, api_key)
+                return
+            except Exception as e:
+                print(f"\n[!] Vision AI error: {e}")
+                print(t("falling_back_tesseract"))
         else:
             print(t("ai_connect_failed", error=msg))
             print(t("falling_back_tesseract"))
@@ -662,7 +674,7 @@ def image_to_docx_ai(src: Path, dst: Path):
         image_to_docx_tesseract(src, dst)
         return
 
-    print(t("ai_connect_success"))
+    print(msg)
     with open(src, "rb") as f:
         img_bytes = f.read()
 
@@ -725,7 +737,7 @@ def image_to_txt_ai(src: Path, dst: Path):
         image_to_txt_tesseract(src, dst)
         return
 
-    print(t("ai_connect_success"))
+    print(msg)
     print(t("running_vision_ai"))
     text = process_page_with_vision_ai(src.read_bytes(), get_gemini_api_key())
     dst.write_text(text, encoding="utf-8")
