@@ -221,13 +221,48 @@ class TestConverterCore(unittest.TestCase):
         self.assertEqual(doc.paragraphs[2].style.name, "List Bullet")
         self.assertEqual(doc.paragraphs[3].text, "Đoạn văn giải thích chi tiết.")
 
-    def test_gemini_models_failover_ordering(self):
-        """Verify dynamic failover model list is non-empty and starts with newest models."""
-        from core.engines import get_configured_gemini_models
-        models = get_configured_gemini_models()
-        self.assertGreaterEqual(len(models), 3)
-        self.assertIn("gemini-3.8-flash", models)
-        self.assertIn("gemini-3.5-flash", models)
+    def test_html_color_and_special_chars_rendering(self):
+        """Verify HTML color spans, font naming, line breaks, and special characters."""
+        from docx.shared import RGBColor
+        from core.engines import render_content_to_docx
+        doc = docx.Document()
+        html = (
+            '<h1 style="color: #004f88">TIÊU ĐỀ XANH</h1>\n'
+            '<p>Điều §4: <span style="color: #ee0000"><b>Đáp án đúng là A</b></span> ✓ ★ →<br>Dòng thứ hai cùng đoạn.</p>'
+        )
+        render_content_to_docx(html, doc)
+        self.assertGreaterEqual(len(doc.paragraphs), 2)
+        # Check title color & font
+        h_run = doc.paragraphs[0].runs[0]
+        self.assertEqual(h_run.font.name, "Times New Roman")
+        self.assertEqual(h_run.font.color.rgb, RGBColor(0, 79, 136))
+        # Check colored run & special characters
+        p = doc.paragraphs[1]
+        self.assertIn("§4", p.text)
+        self.assertIn("✓", p.text)
+        self.assertIn("★", p.text)
+        self.assertIn("→", p.text)
+        colored_runs = [r for r in p.runs if r.font.color and r.font.color.rgb == RGBColor(238, 0, 0)]
+        self.assertTrue(len(colored_runs) > 0, "Red colored span must be rendered as RGBColor(238, 0, 0)")
+        self.assertTrue(colored_runs[0].bold, "Red span must preserve bold styling")
+
+    def test_vector_page_direct_color_extraction(self):
+        """Verify vector PDF direct extraction preserves text and RGB color without OCR."""
+        from docx.shared import RGBColor
+        from core.engines import render_vector_page_to_docx
+        pdf = pymupdf.open()
+        page = pdf.new_page()
+        page.insert_text((50, 50), "Blue Title §1", color=(0.0, 0.31, 0.53), fontsize=16)
+        page.insert_text((50, 80), "Red Answer A: Correct ✓", color=(0.93, 0.0, 0.0), fontsize=12)
+
+        doc = docx.Document()
+        render_vector_page_to_docx(page, doc)
+        pdf.close()
+
+        self.assertGreaterEqual(len(doc.paragraphs), 2)
+        colors = [r.font.color.rgb for p in doc.paragraphs for r in p.runs if r.font.color]
+        self.assertTrue(any(c == RGBColor(0x00, 0x4f, 0x87) for c in colors), "Must extract blue sRGB color")
+        self.assertTrue(any(c == RGBColor(0xed, 0x00, 0x00) for c in colors), "Must extract red sRGB color")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -20,6 +20,9 @@ def is_scanned_pdf(pdf_path: Path) -> bool:
 
 from dataclasses import dataclass
 from html.parser import HTMLParser
+from docx.shared import Pt, RGBColor
+from docx.oxml.ns import qn
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 @dataclass
 class PageContract:
@@ -72,67 +75,246 @@ class PageAuditor:
 
         return len(errors) == 0, errors
 
-class SimpleHTMLTableParser(HTMLParser):
-    def __init__(self):
+def parse_color(val: str):
+    if not val:
+        return None
+    val = val.strip().lower()
+    m = re.search(r"#([0-9a-f]{6})\b", val)
+    if m:
+        h = m.group(1)
+        return RGBColor(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    m = re.search(r"#([0-9a-f]{3})\b", val)
+    if m:
+        h = m.group(1)
+        return RGBColor(int(h[0]*2, 16), int(h[1]*2, 16), int(h[2]*2, 16))
+    named = {
+        "red": RGBColor(238, 0, 0),
+        "blue": RGBColor(0, 79, 136),
+        "green": RGBColor(0, 128, 0),
+        "yellow": RGBColor(255, 215, 0),
+        "black": RGBColor(0, 0, 0),
+    }
+    return named.get(val)
+
+def md_to_html(text: str) -> str:
+    lines = text.split("\n")
+    out = []
+    in_table = False
+    table_rows = []
+
+    def flush_table():
+        nonlocal in_table, table_rows, out
+        if table_rows:
+            out.append("<table>")
+            for r_idx, row in enumerate(table_rows):
+                out.append("<tr>")
+                cols = [c.strip() for c in row.strip("|").split("|")]
+                tag = "th" if r_idx == 0 else "td"
+                for c in cols:
+                    out.append(f"<{tag}>{c}</{tag}>")
+                out.append("</tr>")
+            out.append("</table>")
+            table_rows = []
+            in_table = False
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if in_table:
+                flush_table()
+            continue
+        if "|" in stripped and (stripped.startswith("|") or stripped.endswith("|") or stripped.count("|") >= 2):
+            if re.match(r"^\s*\|?\s*:?-+:?\s*(\|?\s*:?-+:?\s*)+\|?\s*$", stripped):
+                continue
+            in_table = True
+            table_rows.append(stripped)
+            continue
+        elif in_table:
+            flush_table()
+
+        if stripped.startswith("# "):
+            out.append(f"<h1>{stripped[2:].strip()}</h1>")
+        elif stripped.startswith("## "):
+            out.append(f"<h2>{stripped[3:].strip()}</h2>")
+        elif stripped.startswith("### "):
+            out.append(f"<h3>{stripped[4:].strip()}</h3>")
+        elif stripped.startswith(("- ", "* ")):
+            out.append(f"<li>{stripped[2:].strip()}</li>")
+        else:
+            formatted = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", stripped)
+            out.append(f"<p>{formatted}</p>")
+
+    if in_table:
+        flush_table()
+
+    return "\n".join(out)
+
+class HTMLToDocxParser(HTMLParser):
+    def __init__(self, doc):
         super().__init__()
-        self.tables = []
-        self._cur_table = []
-        self._cur_row = []
-        self._cur_cell = []
-        self._in_cell = False
+        self.doc = doc
+        self.cur_p = None
+        self.in_table = False
+        self.cur_tbl_rows = []
+        self.cur_row = []
+        self.cur_cell_runs = []
+        self.style_stack = []
+        self.tables_created = 0
+
+    def _curr_style(self):
+        st = {"bold": False, "italic": False, "underline": False, "color": None, "size": Pt(12)}
+        for s in self.style_stack:
+            for k, v in s.items():
+                if v is not None:
+                    st[k] = v
+        return st
+
+    def _add_run(self, p, text, st):
+        run = p.add_run(text)
+        run.font.name = "Times New Roman"
+        run._element.rPr.rFonts.set(qn("w:eastAsia"), "Times New Roman")
+        if st.get("bold"):
+            run.bold = True
+        if st.get("italic"):
+            run.italic = True
+        if st.get("underline"):
+            run.underline = True
+        if st.get("size"):
+            run.font.size = st["size"]
+        if st.get("color"):
+            run.font.color.rgb = st["color"]
+        return run
 
     def handle_starttag(self, tag, attrs):
-        if tag == "table":
-            self._cur_table = []
+        attr_dict = dict(attrs)
+        style_attr = attr_dict.get("style", "")
+        color_val = attr_dict.get("color", "")
+        parsed_color = parse_color(color_val)
+        if not parsed_color and "color" in style_attr:
+            m = re.search(r"color\s*:\s*([^;\"']+)", style_attr)
+            if m:
+                parsed_color = parse_color(m.group(1))
+
+        if tag in ("h1", "h2", "h3", "h4"):
+            align = WD_ALIGN_PARAGRAPH.CENTER if tag == "h1" else WD_ALIGN_PARAGRAPH.LEFT
+            self.cur_p = self.doc.add_paragraph()
+            self.cur_p.alignment = align
+            self.cur_p.paragraph_format.space_after = Pt(4)
+            size = Pt(14) if tag == "h1" else (Pt(13) if tag == "h2" else Pt(12))
+            self.style_stack.append({"bold": True, "size": size, "color": parsed_color})
+        elif tag == "p":
+            if not self.in_table:
+                self.cur_p = self.doc.add_paragraph()
+                self.cur_p.paragraph_format.space_after = Pt(4)
+                self.cur_p.paragraph_format.line_spacing = 1.15
+            self.style_stack.append({"color": parsed_color})
+        elif tag == "li":
+            self.cur_p = self.doc.add_paragraph(style="List Bullet")
+            self.cur_p.paragraph_format.space_after = Pt(2)
+            self.style_stack.append({"color": parsed_color})
+        elif tag in ("b", "strong"):
+            self.style_stack.append({"bold": True, "color": parsed_color})
+        elif tag in ("i", "em"):
+            self.style_stack.append({"italic": True, "color": parsed_color})
+        elif tag == "u":
+            self.style_stack.append({"underline": True, "color": parsed_color})
+        elif tag in ("span", "font"):
+            self.style_stack.append({"color": parsed_color})
+        elif tag == "br":
+            if self.cur_p and not self.in_table:
+                self.cur_p.add_run().add_break()
+            elif self.in_table:
+                self.cur_cell_runs.append(("\n", self._curr_style()))
+        elif tag == "table":
+            self.in_table = True
+            self.cur_tbl_rows = []
         elif tag == "tr":
-            self._cur_row = []
+            self.cur_row = []
         elif tag in ("td", "th"):
-            self._cur_cell = []
-            self._in_cell = True
+            self.cur_cell_runs = []
+            if tag == "th":
+                self.style_stack.append({"bold": True, "color": parsed_color})
+            else:
+                self.style_stack.append({"color": parsed_color})
 
     def handle_endtag(self, tag):
-        if tag in ("td", "th"):
-            self._cur_row.append("".join(self._cur_cell).strip())
-            self._in_cell = False
+        if tag in ("h1", "h2", "h3", "h4", "p", "li", "b", "strong", "i", "em", "u", "span", "font"):
+            if self.style_stack:
+                self.style_stack.pop()
+        elif tag in ("td", "th"):
+            if self.style_stack:
+                self.style_stack.pop()
+            self.cur_row.append(list(self.cur_cell_runs))
+            self.cur_cell_runs = []
         elif tag == "tr":
-            if self._cur_row:
-                self._cur_table.append(self._cur_row)
+            if self.cur_row:
+                self.cur_tbl_rows.append(list(self.cur_row))
+                self.cur_row = []
         elif tag == "table":
-            if self._cur_table:
-                self.tables.append(self._cur_table)
+            self.in_table = False
+            if self.cur_tbl_rows:
+                rows = len(self.cur_tbl_rows)
+                cols = max((len(r) for r in self.cur_tbl_rows), default=1)
+                tbl = self.doc.add_table(rows=rows, cols=cols)
+                tbl.style = "Table Grid"
+                for r_idx, r in enumerate(self.cur_tbl_rows):
+                    for c_idx, cell_runs in enumerate(r):
+                        if c_idx < cols:
+                            cell = tbl.cell(r_idx, c_idx)
+                            p = cell.paragraphs[0]
+                            p.paragraph_format.space_after = Pt(2)
+                            for text, st in cell_runs:
+                                self._add_run(p, text, st)
+                self.tables_created += 1
+            self.cur_tbl_rows = []
+            self.cur_p = None
 
     def handle_data(self, data):
-        if self._in_cell:
-            self._cur_cell.append(data)
+        if not data:
+            return
+        if not data.strip() and "\n" in data:
+            return
+        st = self._curr_style()
+        if self.in_table:
+            self.cur_cell_runs.append((data, st))
+        else:
+            if self.cur_p is None:
+                self.cur_p = self.doc.add_paragraph()
+                self.cur_p.paragraph_format.space_after = Pt(4)
+                self.cur_p.paragraph_format.line_spacing = 1.15
+            self._add_run(self.cur_p, data, st)
 
-def add_table_data_to_docx(doc, table_data):
-    if not table_data:
-        return None
-    rows = len(table_data)
-    cols = max((len(r) for r in table_data), default=1)
-    if rows == 0 or cols == 0:
-        return None
-    tbl = doc.add_table(rows=rows, cols=cols)
-    tbl.style = "Table Grid"
-    for r_idx, row in enumerate(table_data):
-        for c_idx, text in enumerate(row):
-            if c_idx < cols:
-                cell = tbl.cell(r_idx, c_idx)
-                cell.text = text
-                if r_idx == 0:
-                    for p in cell.paragraphs:
-                        for run in p.runs:
-                            run.bold = True
-    return tbl
-
-def parse_markdown_table_rows(table_lines):
-    parsed = []
-    for r in table_lines:
-        if re.match(r"^\s*\|?\s*:?-+:?\s*(\|?\s*:?-+:?\s*)+\|?\s*$", r):
-            continue
-        cols = [c.strip() for c in r.strip("|").split("|")]
-        parsed.append(cols)
-    return parsed
+def render_vector_page_to_docx(page, doc):
+    """Directly render digital PDF text, colors, and formatting to docx without OCR or AI tokens."""
+    blocks = page.get_text("dict")["blocks"]
+    for b in blocks:
+        if b.get("type") == 0:  # text block
+            p = doc.add_paragraph()
+            p.paragraph_format.space_after = Pt(3)
+            p.paragraph_format.line_spacing = 1.15
+            for line_idx, line in enumerate(b["lines"]):
+                if line_idx > 0 and not p.text.endswith(" "):
+                    p.add_run(" ")
+                for span in line["spans"]:
+                    text = span["text"]
+                    if not text:
+                        continue
+                    run = p.add_run(text)
+                    run.font.name = "Times New Roman"
+                    run._element.rPr.rFonts.set(qn("w:eastAsia"), "Times New Roman")
+                    run.font.size = Pt(max(9, span["size"]))
+                    flags = span.get("flags", 0)
+                    if flags & 16:
+                        run.bold = True
+                    if flags & 2:
+                        run.italic = True
+                    color = span.get("color", 0)
+                    if color and color != 0:
+                        r = (color >> 16) & 0xFF
+                        g = (color >> 8) & 0xFF
+                        b_val = color & 0xFF
+                        if (r, g, b_val) not in [(0, 0, 0), (34, 34, 34)]:
+                            run.font.color.rgb = RGBColor(r, g, b_val)
 
 import time
 
@@ -174,17 +356,15 @@ def process_page_with_vision_ai(img_bytes: bytes, api_key: str, feedback: str = 
 
     client = genai.Client(api_key=api_key, http_options={"timeout": 60000})
     prompt = (
-        "Convert this document page into clean standard format:\n"
-        "- 100% ACCURACY: transcribe every single word, number, character, and accent.\n"
-        "- NEVER summarize, truncate, or omit any text, notes, or headers.\n"
-        "- MULTI-COLUMN ORDER: If the page has 2 columns or 2 side-by-side sections/slides, "
-        "read the ENTIRE LEFT column from top to bottom first, then the ENTIRE RIGHT column from top to bottom. "
-        "DO NOT interleave lines horizontally across columns.\n"
-        "- Use #, ##, ### for titles and headings.\n"
-        "- Format ALL tables using standard HTML <table><tr><th>/<td> tags "
-        "so multiline cells, headers, and rows are completely preserved without clipping.\n"
-        "- Lists: Use - or * for bullets.\n"
-        "- Return raw content only (no markdown code block fences, no conversational explanations)."
+        "Convert this document page into clean standard HTML format without markdown code blocks:\n"
+        "- 100% ACCURACY: Transcribe every single word, accent, number, and special character exactly.\n"
+        "- PRESERVE COLORS: If text is colored (e.g. red answer keys, blue headings/titles, green, etc.), "
+        "you MUST wrap it in <span style=\"color: #HEX\">...</span> with the exact hex color.\n"
+        "- STRUCTURE: Use <h1>, <h2>, <h3> for titles; <p> for paragraphs; <br> for manual line breaks inside paragraphs; "
+        "<ul>/<ol>/<li> for bullet/numbered lists; <table><tr><th>/<td> for tables.\n"
+        "- FORMATTING: Use <b> or <strong> for bold, <i> or <em> for italic, <u> for underline.\n"
+        "- NEVER omit, summarize, or alter any text, notes, headers, or special characters (e.g., §, ✓, ★, →, bullets, quotes).\n"
+        "- Output clean raw HTML only."
     )
     if feedback:
         prompt += f"\n\nCRITICAL AUDIT FEEDBACK FROM PREVIOUS ATTEMPT:\n{feedback}\nYou must include ALL missing elements above."
@@ -235,97 +415,18 @@ def process_page_with_vision_ai(img_bytes: bytes, api_key: str, feedback: str = 
     raise last_err
 
 def render_content_to_docx(raw_text: str, doc) -> int:
-    """Render structured text containing HTML tables, Markdown headings, and paragraphs to docx."""
-    from docx.shared import Pt
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-
+    """Render structured HTML or Markdown text into DOCX with colors, fonts, and styles."""
     clean = re.sub(r"^```(?:html|markdown)?\s*", "", raw_text.strip(), flags=re.IGNORECASE)
     clean = re.sub(r"\s*```$", "", clean)
-
-    chunks = re.split(r"(<table[\s\S]*?</table>)", clean, flags=re.IGNORECASE)
-    total_tables = 0
-
-    for chunk in chunks:
-        chunk_stripped = chunk.strip()
-        if not chunk_stripped:
-            continue
-
-        if re.match(r"^<table[\s\S]*?</table>$", chunk_stripped, flags=re.IGNORECASE):
-            parser = SimpleHTMLTableParser()
-            parser.feed(chunk_stripped)
-            for tbl_data in parser.tables:
-                if add_table_data_to_docx(doc, tbl_data):
-                    total_tables += 1
-            continue
-
-        lines = chunk_stripped.split("\n")
-        in_md_table = False
-        md_table_rows = []
-
-        def flush_md_table():
-            nonlocal in_md_table, md_table_rows, total_tables
-            if md_table_rows:
-                t_data = parse_markdown_table_rows(md_table_rows)
-                if add_table_data_to_docx(doc, t_data):
-                    total_tables += 1
-            md_table_rows = []
-            in_md_table = False
-
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                if in_md_table:
-                    flush_md_table()
-                continue
-
-            if "|" in stripped and (stripped.startswith("|") or stripped.endswith("|") or stripped.count("|") >= 2):
-                in_md_table = True
-                md_table_rows.append(stripped)
-                continue
-            elif in_md_table:
-                flush_md_table()
-
-            if stripped.startswith("# "):
-                p = doc.add_paragraph()
-                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                run = p.add_run(stripped[2:].strip())
-                run.bold = True
-                run.font.size = Pt(14)
-            elif stripped.startswith("## "):
-                p = doc.add_paragraph()
-                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                run = p.add_run(stripped[3:].strip())
-                run.bold = True
-                run.font.size = Pt(12)
-            elif stripped.startswith("### "):
-                p = doc.add_paragraph()
-                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                run = p.add_run(stripped[4:].strip())
-                run.bold = True
-                run.font.size = Pt(11)
-            elif stripped.startswith(("- ", "* ")):
-                doc.add_paragraph(stripped[2:].strip(), style="List Bullet")
-            else:
-                p = doc.add_paragraph()
-                p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                p.paragraph_format.space_after = Pt(6)
-                p.paragraph_format.line_spacing = 1.15
-                parts = re.split(r"(\*\*.*?\*\*)", stripped)
-                for part in parts:
-                    if part.startswith("**") and part.endswith("**"):
-                        run = p.add_run(part[2:-2])
-                        run.bold = True
-                    else:
-                        p.add_run(part)
-
-        if in_md_table:
-            flush_md_table()
-
-    return total_tables
+    if "<" not in clean or not re.search(r"<(?:h[1-6]|p|table|tr|div|span|ul|ol|li)\b", clean, re.IGNORECASE):
+        clean = md_to_html(clean)
+    parser = HTMLToDocxParser(doc)
+    parser.feed(clean)
+    return parser.tables_created
 
 def render_markdown_to_docx(md_text: str, doc):
     """Render structured Markdown text into Microsoft Word DOCX elements."""
-    render_content_to_docx(md_text, doc)
+    return render_content_to_docx(md_text, doc)
 
 def get_page_image_slices(page, pdf_in, auto_split_2up: bool = False) -> list[bytes]:
     """Extract page image, keeping full page intact unless 2-up book split is explicitly enabled."""
@@ -372,34 +473,16 @@ def pdf_vision_ai_to_docx(src: Path, dst: Path, api_key: str):
     total_pages = len(pdf_in)
     for idx, page in enumerate(pdf_in, 1):
         print(t("page_progress_ai", page=idx, total=total_pages))
-        contract = PageAuditor.extract_pdf_contract(page)
-        pix = page.get_pixmap(dpi=200)
-        img_bytes = pix.tobytes("png")
-
-        feedback = ""
-        output_content = ""
-        passed = False
-        audit_errors = []
-
-        for attempt in range(2):
-            output_content = process_page_with_vision_ai(img_bytes, api_key, feedback=feedback)
-            has_table_in_out = bool(re.search(r"<table[\s\S]*?</table>", output_content, re.IGNORECASE)) or ("|" in output_content)
-            passed, audit_errors = PageAuditor.audit_page(
-                contract,
-                output_content,
-                docx_tables_count=1 if has_table_in_out else 0
-            )
-            if passed or not contract.numbers:
-                break
-            feedback = "; ".join(audit_errors)
-            print(f"  [!] Audit retry page {idx} (attempt {attempt+1}): {feedback}")
-
-        tbl_count = render_content_to_docx(output_content, doc_out)
-
-        if passed or not audit_errors:
-            print(f"  [✓] Page {idx} Audit PASSED: 1-1 page parity maintained.")
+        page_text = page.get_text().strip()
+        if len(page_text) >= 20:
+            print(f"  [✓] Page {idx}: Digital vector text detected ({len(page_text)} chars). Extracting native text & colors.")
+            render_vector_page_to_docx(page, doc_out)
         else:
-            print(f"  [!] Page {idx} Audit Warning: {audit_errors[0]}")
+            pix = page.get_pixmap(dpi=200)
+            img_bytes = pix.tobytes("png")
+            output_content = process_page_with_vision_ai(img_bytes, api_key)
+            render_content_to_docx(output_content, doc_out)
+            print(f"  [✓] Page {idx}: Vision AI transcription complete.")
 
         if idx < total_pages:
             doc_out.add_page_break()
@@ -522,6 +605,7 @@ def extract_page_layout_tesseract(img_bytes: bytes, tess_cmd: str):
 def render_tesseract_elements_to_docx(doc_out, elements):
     from docx.shared import Pt
     from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
 
     for elem_type, text in elements:
         text = text.strip()
@@ -529,10 +613,13 @@ def render_tesseract_elements_to_docx(doc_out, elements):
             continue
 
         if elem_type == "bullet":
-            p = doc_out.add_paragraph(text, style="List Bullet")
+            p = doc_out.add_paragraph(style="List Bullet")
             p.paragraph_format.space_after = Pt(3)
             p.paragraph_format.space_before = Pt(0)
             p.paragraph_format.line_spacing = 1.15
+            run = p.add_run(text)
+            run.font.name = "Times New Roman"
+            run._element.rPr.rFonts.set(qn("w:eastAsia"), "Times New Roman")
             continue
 
         p = doc_out.add_paragraph()
@@ -554,6 +641,8 @@ def render_tesseract_elements_to_docx(doc_out, elements):
             p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             run = p.add_run(text)
             run.font.size = Pt(12)
+        run.font.name = "Times New Roman"
+        run._element.rPr.rFonts.set(qn("w:eastAsia"), "Times New Roman")
 
 def pdf_tesseract_to_docx(src: Path, dst: Path):
     import pymupdf, docx
@@ -640,7 +729,22 @@ def convert_pdf_with_ai(src: Path, dst: Path):
 def convert_pdf_hybrid(src: Path, dst: Path):
     if not is_scanned_pdf(src):
         print(t("detected_vector_pdf"))
-        pdf_layout_to_docx(src, dst)
+        import pymupdf, docx
+        from docx.shared import Inches
+        doc_pdf = pymupdf.open(str(src))
+        doc_out = docx.Document()
+        for sec in doc_out.sections:
+            sec.top_margin = Inches(1)
+            sec.bottom_margin = Inches(1)
+            sec.left_margin = Inches(1)
+            sec.right_margin = Inches(1)
+        total = len(doc_pdf)
+        for idx, page in enumerate(doc_pdf, 1):
+            render_vector_page_to_docx(page, doc_out)
+            if idx < total:
+                doc_out.add_page_break()
+        doc_pdf.close()
+        save_docx_safely(doc_out, dst)
         return
 
     print(t("detected_scanned_pdf"))
